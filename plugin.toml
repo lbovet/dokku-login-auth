@@ -1,0 +1,5 @@
+[plugin]
+description = "Authentication for Dokku apps: form login + SSO and static API keys"
+version = "0.1.0"
+
+[plugin.config]
