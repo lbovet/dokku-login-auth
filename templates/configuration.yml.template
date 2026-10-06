@@ -51,7 +51,6 @@ session:
   cookies:
     - domain: '<PARENT_DOMAIN>'
       authelia_url: 'https://auth.<PARENT_DOMAIN>'
-      default_redirection_url: 'https://auth.<PARENT_DOMAIN>'
       expiration: '1h'
       inactivity: '15m'
 
