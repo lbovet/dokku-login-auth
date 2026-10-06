@@ -57,7 +57,7 @@ load test_helper
 
   run grep -q 'default              "none";' "$LOGIN_AUTH_GLOBAL_CONF"
   [ "$status" -eq 0 ]
-  run grep -q '~\^/admin(/|$)   "form";' "$LOGIN_AUTH_GLOBAL_CONF"
+  run grep -qF '~^/admin(/|$)   "form";' "$LOGIN_AUTH_GLOBAL_CONF"
   [ "$status" -eq 0 ]
 }
 
@@ -114,7 +114,7 @@ load test_helper
   run cmd-login-auth-bypass app1 --path /api/webhook
   [ "$status" -eq 0 ]
 
-  grep -q '~\^/api/webhook(/|$)   "none";' "$LOGIN_AUTH_GLOBAL_CONF"
+  grep -qF '~^/api/webhook(/|$)   "none";' "$LOGIN_AUTH_GLOBAL_CONF"
 }
 
 @test "enable fails before writing when auth-portal has no upstream" {
