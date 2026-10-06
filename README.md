@@ -18,7 +18,10 @@ For each protected app the plugin generates:
 
 - `login-auth-00-internal.conf` — a fixed `auth_request` target
   (`/internal/login-auth/authz`) that branches on the request's resolved mode,
-  plus the mode-aware `@login_auth_redirect__<app>` named location.
+  the mode-aware `@login_auth_redirect__<app>` named location, and an
+  exact-match `/400-error.html` location that turns an Authelia `401`
+  `Location` into the portal redirect (Dokku's base `error_page 401` wins at
+  server level, so the plugin shadows its internal handler instead);
 - `login-auth-10-server.conf` — `server`-level `auth_request` /
   `error_page` / `map`-driven API-key enforcement and `headers-more` identity
   injection (`Remote-User`, `Remote-Groups`, `Remote-Email`, `Remote-Name`).
