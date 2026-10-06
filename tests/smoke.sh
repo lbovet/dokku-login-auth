@@ -56,6 +56,15 @@ else
   fail "GET $form_url -> $status (location: $location); expected 302 to auth.$PARENT_DOMAIN"
 fi
 
+info "form login: an Authorization: Bearer header does not bypass the portal"
+status="$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer not-a-real-key' "$form_url")"
+location="$(curl -s -o /dev/null -w '%{redirect_url}' -H 'Authorization: Bearer not-a-real-key' "$form_url")"
+if [[ "$status" == "302" && "$location" == *"auth.$PARENT_DOMAIN"* ]]; then
+  pass "GET $form_url with a Bearer header -> 302 to $location (not bypassed)"
+else
+  fail "GET $form_url with a Bearer header -> $status (location: $location); expected 302 to auth.$PARENT_DOMAIN"
+fi
+
 if [[ -n "$API_APP" ]]; then
   info "api key: missing Authorization header returns 401 (not a redirect)"
   status="$(curl -s -o /dev/null -w '%{http_code}' "https://$API_APP.$PARENT_DOMAIN$API_BASE")"

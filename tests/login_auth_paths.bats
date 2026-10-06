@@ -12,6 +12,27 @@ load test_helper
   grep -q 'default              "form";' "$LOGIN_AUTH_GLOBAL_CONF"
 }
 
+@test "form-only app gets a defined apikey map and stays form-protected" {
+  run cmd-login-auth-enable-form app1 --path /
+  [ "$status" -eq 0 ]
+
+  # Regression for the pilot failure `unknown "login_auth_apikey_ok__app1"`:
+  # the server snippet references the variable, so the global two-stage map must
+  # exist even though the app has no apikey path.
+  local file="$DOKKU_ROOT/app1/nginx.conf.d/login-auth-10-server.conf"
+  grep -q 'if ($login_auth_apikey_ok__app1 = 1)' "$file"
+
+  local map
+  map="$(fn-login-auth-apikey-map-path app1)"
+  [ -f "$map" ]
+  [ ! -s "$map" ]
+  grep -qF "include $map;" "$LOGIN_AUTH_GLOBAL_CONF"
+
+  # An empty key map means a Bearer header cannot flip apikey_ok to 1, and the
+  # path's mode is form (not apikey), so it is never bypassed by the header.
+  [ "$(fn-login-auth-get-mode app1 /)" == "form" ]
+}
+
 @test "server-level enforcement never declares proxy_pass or proxy_set_header" {
   run cmd-login-auth-enable-form app1
   [ "$status" -eq 0 ]

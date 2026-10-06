@@ -10,11 +10,28 @@ load test_helper
   grep -qF "include $LOGIN_AUTH_NGINX_ROOT/app1/apikeys.map;" "$LOGIN_AUTH_GLOBAL_CONF"
 }
 
-@test "no apikey block is generated for apps without apikey paths" {
+@test "form-only app still gets the apikey map so the variable is defined" {
   cmd-login-auth-enable-form app1 --path /
 
-  run grep -qF 'login_auth_apikey_token__app1' "$LOGIN_AUTH_GLOBAL_CONF"
-  [ "$status" -ne 0 ]
+  grep -qF 'map $http_authorization $login_auth_apikey_token__app1 {' "$LOGIN_AUTH_GLOBAL_CONF"
+  grep -qF 'map $login_auth_apikey_token__app1 $login_auth_apikey_ok__app1 {' "$LOGIN_AUTH_GLOBAL_CONF"
+  grep -qF "include $LOGIN_AUTH_NGINX_ROOT/app1/apikeys.map;" "$LOGIN_AUTH_GLOBAL_CONF"
+
+  local map
+  map="$(fn-login-auth-apikey-map-path app1)"
+  [ -f "$map" ]
+  [ ! -s "$map" ]
+}
+
+@test "mixed form+apikey app emits the enforcement block and the map" {
+  cmd-login-auth-enable-form app1 --path /
+  cmd-login-auth-enable-apikey app1 --path /api
+
+  local file="$DOKKU_ROOT/app1/nginx.conf.d/login-auth-10-server.conf"
+  grep -q 'if ($login_auth_mode__app1 = "apikey")' "$file"
+  grep -q 'if ($login_auth_apikey_ok__app1 = 1)' "$file"
+  grep -q 'if ($login_auth_apikey_check__app1 = "check")' "$file"
+  grep -qF 'map $login_auth_apikey_token__app1 $login_auth_apikey_ok__app1 {' "$LOGIN_AUTH_GLOBAL_CONF"
 }
 
 @test "enabling apikey creates an empty map file so nginx config stays valid" {

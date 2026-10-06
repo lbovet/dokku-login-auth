@@ -14,7 +14,10 @@ auth_request_set $login_auth_name__<APP_SANITIZED>     $upstream_http_remote_nam
 # below returns 401 instead of redirecting.
 error_page 401 = @login_auth_redirect__<APP_SANITIZED>;
 
-# API-key enforcement (applies only on `apikey` paths):
+# API-key enforcement. `$login_auth_apikey_ok__<APP_SANITIZED>` is always defined
+# because the global two-stage map is emitted for every configured app, even a
+# form-only one; for non-apikey paths `$login_auth_apikey_check__` is never set
+# to "check", so this block is inert.
 if ($login_auth_mode__<APP_SANITIZED> = "apikey") {
     set $login_auth_apikey_check__<APP_SANITIZED> "check";
 }

@@ -391,12 +391,16 @@ fn-login-auth-render-global() {
 
   while IFS= read -r app; do
     [[ -n "$app" ]] || continue
-    fn-login-auth-render-routing-block "$app" >>"$tmp"
-    printf '\n' >>"$tmp"
-    if fn-login-auth-has-mode "$app" apikey; then
-      fn-login-auth-render-apikey-block "$app" >>"$tmp"
-      printf '\n' >>"$tmp"
-    fi
+    # Emitted for every configured app, not only apikey ones: the server-level
+    # enforcement (login-auth-10-server.conf) references $login_auth_apikey_ok__*
+    # unconditionally, so the map must always be defined. For a form-only app the
+    # map yields 0 and the enforcement is inert (mode is never "apikey").
+    {
+      fn-login-auth-render-routing-block "$app"
+      printf '\n'
+      fn-login-auth-render-apikey-block "$app"
+      printf '\n'
+    } >>"$tmp"
   done < <(fn-login-auth-list-configured-apps)
 
   # Overwrite the include in place. A temp file in /etc/nginx/conf.d (or a
