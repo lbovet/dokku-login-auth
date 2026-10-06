@@ -63,5 +63,7 @@ location = /400-error.html {
         return 302 $login_auth_redirect__<APP_SANITIZED>;
     }
 
+    # Same root as Dokku's own `location /400-error.html`; source of truth is
+    # plugins/nginx-vhosts/templates/nginx.conf.sigil.
     root <DOKKU_ERROR_ROOT>;
 }
