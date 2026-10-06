@@ -12,7 +12,8 @@ load test_helper
   [ -f "$users" ]
   grep -q "domain: 'example.com'" "$config"
   grep -q "authelia_url: 'https://auth.example.com'" "$config"
-  grep -q 'users: {}' "$users"
+  grep -q '__placeholder__' "$users"
+  grep -q 'disabled: true' "$users"
 }
 
 @test "init is idempotent and preserves secrets" {
