@@ -76,9 +76,21 @@ fn-login-auth-regex-escape() {
 fn-login-auth-ensure-dirs() {
   declare desc="create the plugin's base directories"
   mkdir -p "$LOGIN_AUTH_SERVICE_ROOT" "$LOGIN_AUTH_NGINX_ROOT"
+  # plugin:install runs as root while every other command runs as the dokku
+  # user, so hand the trees over to dokku while we still have the privilege.
+  # Without this, login-auth:init (running as dokku) cannot create
+  # $LOGIN_AUTH_GLOBAL_STATE_DIR under the root-owned service root.
+  if [[ "$(id -u)" == "0" ]] && id dokku >/dev/null 2>&1; then
+    chown -R dokku:dokku "$LOGIN_AUTH_SERVICE_ROOT" "$LOGIN_AUTH_NGINX_ROOT" 2>/dev/null || true
+  fi
   if [[ ! -f "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER" ]]; then
     mkdir -p "$(dirname "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER")"
     printf '%s\n' "$LOGIN_AUTH_MANAGED_HEADER" >"$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER"
+  fi
+  # /etc/nginx/conf.d is root-owned but nginx-pre-reload runs as dokku and
+  # rewrites the include in place, so make just this file writable by dokku.
+  if [[ "$(id -u)" == "0" ]] && id dokku >/dev/null 2>&1; then
+    chown dokku:dokku "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER" 2>/dev/null || true
   fi
 }
 
@@ -373,10 +385,8 @@ fn-login-auth-render-per-app() {
 
 fn-login-auth-render-global() {
   declare desc="regenerate the global http-context routing/map file (SPEC §6.2/§6.4)"
-  local conf_dir tmp app
-  conf_dir="$(dirname "$LOGIN_AUTH_GLOBAL_CONF")"
-  mkdir -p "$conf_dir"
-  tmp="$(mktemp "$conf_dir/.login-auth-routing.XXXXXX")"
+  local tmp app
+  tmp="$(mktemp)"
   printf '%s\n\n' "$LOGIN_AUTH_MANAGED_HEADER" >"$tmp"
 
   while IFS= read -r app; do
@@ -389,7 +399,15 @@ fn-login-auth-render-global() {
     fi
   done < <(fn-login-auth-list-configured-apps)
 
-  mv "$tmp" "$LOGIN_AUTH_GLOBAL_CONF"
+  # Overwrite the include in place. A temp file in /etc/nginx/conf.d (or a
+  # rename into it) is not writable because that directory is root-owned while
+  # nginx-pre-reload runs as the dokku user; the include itself is chowned to
+  # dokku by fn-login-auth-ensure-dirs during plugin:install.
+  if ! cat "$tmp" >"$LOGIN_AUTH_GLOBAL_CONF"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
 }
 
 # ---------------------------------------------------------------------------
