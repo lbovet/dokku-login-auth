@@ -1,1 +1,7 @@
-users: {}
+users:
+  __placeholder__:
+    disabled: true
+    displayname: "Disabled placeholder (seeded by login-auth:init)"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$YsUxK6ox9HDzXalPbZ5U9Q$U8XoYHwVQMBCEvvIOafvt1KQm6OBJJVZoe96uJv445I"
+    email: ""
+    groups: []

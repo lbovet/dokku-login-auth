@@ -464,7 +464,9 @@ cmd-login-auth-init() {
   mkdir -p "$config_root"
   chown -R 1000:1000 "$(dirname "$config_root")" 2>/dev/null || true
 
-  if ! dokku storage:list "$LOGIN_AUTH_AUTH_PORTAL_APP" 2>/dev/null | grep -q ":$config_root"; then
+  # `storage:list` prints the mapping as `<host>:/container` on its own line,
+  # so match the host path followed by the container target.
+  if ! dokku storage:list "$LOGIN_AUTH_AUTH_PORTAL_APP" 2>/dev/null | grep -qF "$config_root:/config"; then
     dokku storage:mount "$LOGIN_AUTH_AUTH_PORTAL_APP" "$config_root:/config" >/dev/null 2>&1 || \
       dokku_log_warn "could not mount storage; mount it manually: dokku storage:mount $LOGIN_AUTH_AUTH_PORTAL_APP $config_root:/config"
   fi
