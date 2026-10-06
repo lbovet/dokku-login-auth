@@ -21,6 +21,11 @@ load test_helper
   [ "$status" -ne 0 ]
 }
 
+@test "authelia image pin is explicit and frozen" {
+  [ "$LOGIN_AUTH_AUTHELIA_IMAGE" == "authelia/authelia:4.38.19" ]
+  [[ "$LOGIN_AUTH_AUTHELIA_IMAGE" != *":latest"* ]]
+}
+
 @test "managed header is present in every generated file" {
   cmd-login-auth-enable-form app1 --path /
   cmd-login-auth-enable-apikey app1 --path /api
