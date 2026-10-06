@@ -35,6 +35,21 @@ Every generated file is plugin-owned and starts with
 The login server runs as its own Dokku app, `auth-portal`, backed by
 [Authelia](https://www.authelia.com/) with a flat-file user store.
 
+### Portal theme
+
+Fresh installs render `configuration.yml` with `theme: 'auto'`, so the portal
+follows the device/system `prefers-color-scheme`. On an existing install you can
+override the theme without rewriting `configuration.yml` (Authelia resolves
+configuration as defaults → files → environment, so the environment wins):
+
+```bash
+dokku config:set auth-portal AUTHELIA_THEME=auto   # or 'light' / 'dark'
+```
+
+This is the recommended path for existing portals, because
+`login-auth:init` preserves an existing `configuration.yml` (only `--force`
+rewrites it, and that rotates the JWT/session/storage secrets).
+
 ## Requirements
 
 - Dokku with its nginx-vhosts plugin (per-app `nginx.conf.d/` include).
