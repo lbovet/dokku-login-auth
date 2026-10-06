@@ -5,11 +5,12 @@
 The bats suite under this directory is self-contained: it stubs `dokku`,
 `docker` and `verify_app_name`, and operates entirely on temporary
 directories. It needs `bats`, `jq`, `yq` (mikefarah v4) and `openssl` on
-`PATH`.
+`PATH`. One regression test (`login_auth_nginx_redirect.bats`) additionally
+runs a real `nginx` process and is skipped when `nginx` is not installed.
 
 ```bash
 # Debian/Ubuntu
-sudo apt-get install -y bats jq openssl
+sudo apt-get install -y bats jq openssl nginx
 sudo curl -fsSL -o /usr/local/bin/yq \
   https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64
 sudo chmod +x /usr/local/bin/yq
@@ -24,6 +25,8 @@ What it covers:
 
 - per-app nginx rendering (fixed `auth_request` target, mode-aware redirect
   location, `headers-more` identity injection);
+- end-to-end HTTP precedence against a real nginx (form `302`, apikey `401`,
+  bypass passthrough, Dokku's base error page preserved);
 - longest-prefix-first routing-map generation and regex escaping
   (SPEC §10 #12);
 - path/mode validation, `--force`, idempotency and tolerant no-ops;

@@ -376,6 +376,7 @@ fn-login-auth-render-per-app() {
   fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/internal-locations.conf.template" \
     "APP_SANITIZED=$sanitized" \
     "AUTH_PORTAL_UPSTREAM=$upstream" \
+    "DOKKU_ERROR_ROOT=$DOKKU_LIB_ROOT/data/nginx-vhosts/dokku-errors" \
     >"$app_root/login-auth-00-internal.conf"
 
   fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/server-enforcement.conf.template" \

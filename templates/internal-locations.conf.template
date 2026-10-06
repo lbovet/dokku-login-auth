@@ -35,10 +35,33 @@ location = /internal/login-auth/authz {
 
 # Redirect target when a form-path auth_request sub-request returns 401.
 # It must NOT turn an apikey 401 into a redirect, hence the mode branch.
+# Kept for servers that have no Dokku base error_page (the plain-HTTP
+# redirect server), where the plugin's own error_page is the only one.
 location @login_auth_redirect__<APP_SANITIZED> {
     internal;
     if ($login_auth_mode__<APP_SANITIZED> = "apikey") {
         return 401;
     }
     return 302 $login_auth_redirect__<APP_SANITIZED>;
+}
+
+# Dokku's app template declares `error_page 400 401 402 403 405 ... /400-error.html`
+# BEFORE this include. nginx keeps the first error_page for a status code, so the
+# plugin's own server-level `error_page 401 = @login_auth_redirect__...` is shadowed
+# on the HTTPS server. Shadow Dokku's internal handler instead with an exact-match
+# location: every Dokku 4xx-family error page lands here. When Authelia supplied a
+# Location header (form auth failed) redirect to it, otherwise serve Dokku's
+# original error page unchanged.
+#
+# This is the one deliberate exception to the "never shadow Dokku's generated
+# config" rule: it shadows a single URI in plugin-owned files only, never modifies
+# a Dokku file, and falls back to Dokku's own error page for every non-auth error.
+location = /400-error.html {
+    internal;
+
+    if ($login_auth_redirect__<APP_SANITIZED> != "") {
+        return 302 $login_auth_redirect__<APP_SANITIZED>;
+    }
+
+    root <DOKKU_ERROR_ROOT>;
 }
