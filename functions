@@ -76,6 +76,13 @@ fn-login-auth-regex-escape() {
 fn-login-auth-ensure-dirs() {
   declare desc="create the plugin's base directories"
   mkdir -p "$LOGIN_AUTH_SERVICE_ROOT" "$LOGIN_AUTH_NGINX_ROOT"
+  # plugin:install runs as root while every other command runs as the dokku
+  # user, so hand the trees over to dokku while we still have the privilege.
+  # Without this, login-auth:init (running as dokku) cannot create
+  # $LOGIN_AUTH_GLOBAL_STATE_DIR under the root-owned service root.
+  if [[ "$(id -u)" == "0" ]] && id dokku >/dev/null 2>&1; then
+    chown -R dokku:dokku "$LOGIN_AUTH_SERVICE_ROOT" "$LOGIN_AUTH_NGINX_ROOT" 2>/dev/null || true
+  fi
   if [[ ! -f "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER" ]]; then
     mkdir -p "$(dirname "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER")"
     printf '%s\n' "$LOGIN_AUTH_MANAGED_HEADER" >"$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER"
