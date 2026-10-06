@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+[[ " help login-auth:help " == *" $1 "* ]] || exit "$DOKKU_NOT_IMPLEMENTED_EXIT"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/help-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+case "$1" in
+  help | login-auth:help)
+    cmd-login-auth-help "$@"
+    ;;
+
+  *)
+    exit "$DOKKU_NOT_IMPLEMENTED_EXIT"
+    ;;
+
+esac

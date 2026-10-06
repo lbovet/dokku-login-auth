@@ -1,0 +1,71 @@
+---
+theme: 'light'
+
+server:
+  address: 'tcp://:9091'
+  endpoints:
+    authz:
+      auth-request:
+        implementation: 'AuthRequest'
+
+log:
+  level: 'info'
+
+identity_validation:
+  reset_password:
+    jwt_secret: '<JWT_SECRET>'
+
+authentication_backend:
+  file:
+    path: '/config/users.yml'
+    password:
+      algorithm: 'argon2'
+      argon2:
+        variant: 'argon2id'
+        iterations: 3
+        memory: 65536
+        parallelism: 4
+        key_length: 32
+        salt_length: 16
+
+access_control:
+  default_policy: 'deny'
+  rules:
+    # Portal self-access (login UI / static assets) must be pre-auth.
+    - domain: 'auth.<PARENT_DOMAIN>'
+      policy: 'bypass'
+      resources:
+        - '^/api/authz/auth-request([/?].*)?$'
+        - '^/(static|locales)/.*$'
+    # The rule domain is matched against the ORIGINAL target URL (from
+    # X-Original-URL), i.e. the protected app's domain — not
+    # auth.<PARENT_DOMAIN>. Without a rule matching the protected apps,
+    # default_policy: deny would deny every post-login request. This makes
+    # the ACL decision "one_factor" for every app subdomain; the nginx
+    # layer decides which paths actually trigger auth_request.
+    - domain: '*.<PARENT_DOMAIN>'
+      policy: 'one_factor'
+
+session:
+  secret: '<SESSION_SECRET>'
+  cookies:
+    - domain: '<PARENT_DOMAIN>'
+      authelia_url: 'https://auth.<PARENT_DOMAIN>'
+      default_redirection_url: 'https://auth.<PARENT_DOMAIN>'
+      expiration: '1h'
+      inactivity: '15m'
+
+regulation:
+  max_retries: 5
+  find_time: '2m'
+  ban_time: '5m'
+
+storage:
+  encryption_key: '<STORAGE_SECRET>'
+  local:
+    path: '/config/db.sqlite3'
+
+notifier:
+  disable_startup_check: true
+  filesystem:
+    filename: '/config/notification.txt'

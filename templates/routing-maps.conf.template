@@ -1,0 +1,5 @@
+# Resolves which enforcement mode applies to this request's path, for app <APP>.
+map $uri $login_auth_mode__<APP_SANITIZED> {
+    default              "<DEFAULT_MODE>";
+<MAP_ENTRIES>
+}

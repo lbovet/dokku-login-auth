@@ -1,0 +1,11 @@
+# 1) strip the "Bearer " scheme, keep the raw token
+map $http_authorization $login_auth_apikey_token__<APP_SANITIZED> {
+    default              "";
+    "~^Bearer\s+(.+)$"   $1;
+}
+
+# 2) compare the raw token against the app's key file
+map $login_auth_apikey_token__<APP_SANITIZED> $login_auth_apikey_ok__<APP_SANITIZED> {
+    default 0;
+    include <APIKEY_MAP_PATH>;
+}

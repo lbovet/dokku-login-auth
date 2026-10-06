@@ -1,0 +1,34 @@
+# Managed by dokku-login-auth. Do not edit manually.
+
+# Fixed target; branching happens inside the internal authz location.
+# `auth_request $var` does NOT work — nginx uses the variable literally.
+auth_request /internal/login-auth/authz;
+
+auth_request_set $login_auth_redirect__<APP_SANITIZED> $upstream_http_location;
+auth_request_set $login_auth_user__<APP_SANITIZED>     $upstream_http_remote_user;
+auth_request_set $login_auth_groups__<APP_SANITIZED>   $upstream_http_remote_groups;
+auth_request_set $login_auth_email__<APP_SANITIZED>    $upstream_http_remote_email;
+auth_request_set $login_auth_name__<APP_SANITIZED>     $upstream_http_remote_name;
+
+# form paths: redirect to the portal. apikey paths: the named location
+# below returns 401 instead of redirecting.
+error_page 401 = @login_auth_redirect__<APP_SANITIZED>;
+
+# API-key enforcement (applies only on `apikey` paths):
+if ($login_auth_mode__<APP_SANITIZED> = "apikey") {
+    set $login_auth_apikey_check__<APP_SANITIZED> "check";
+}
+if ($login_auth_apikey_ok__<APP_SANITIZED> = 1) {
+    set $login_auth_apikey_check__<APP_SANITIZED> "";
+}
+if ($login_auth_apikey_check__<APP_SANITIZED> = "check") {
+    return 401;
+}
+
+# Identity propagation (headers-more). Unconditional: on none/apikey paths
+# the variables are empty, which strips any client-supplied Remote-* header
+# rather than forwarding it, so backends can trust these values.
+more_set_input_headers "Remote-User:   $login_auth_user__<APP_SANITIZED>";
+more_set_input_headers "Remote-Groups: $login_auth_groups__<APP_SANITIZED>";
+more_set_input_headers "Remote-Email:  $login_auth_email__<APP_SANITIZED>";
+more_set_input_headers "Remote-Name:   $login_auth_name__<APP_SANITIZED>";
