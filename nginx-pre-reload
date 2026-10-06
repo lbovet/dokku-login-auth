@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Best-effort, idempotent regeneration of login-auth nginx config before nginx reloads.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+if [[ -n "${PLUGIN_CORE_AVAILABLE_PATH:-}" ]] && [[ -f "$PLUGIN_CORE_AVAILABLE_PATH/common/functions" ]]; then
+  # shellcheck source=/dev/null
+  source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+fi
+
+LOGIN_AUTH_PRE_RELOAD_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$LOGIN_AUTH_PRE_RELOAD_PLUGIN_DIR/functions"
+
+trigger-login-auth-nginx-pre-reload() {
+  declare desc="regenerate the login-auth nginx include whenever nginx config is rebuilt"
+  declare trigger="nginx-pre-reload"
+  declare APP="$1"
+
+  [[ -n "$APP" ]] || return 0
+
+  # Never let a sync failure abort an nginx reload for unrelated apps.
+  if ! fn-login-auth-sync-app "$APP" >/dev/null 2>&1; then
+    dokku_log_warn "login-auth: could not regenerate config for $APP; continuing with nginx reload"
+  fi
+  return 0
+}
+
+trigger-login-auth-nginx-pre-reload "$@"

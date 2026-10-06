@@ -54,7 +54,7 @@ Pinned dependencies (recorded here so upgrades are explicit; never use
 | Dependency | Pinned version | Notes |
 |---|---|---|
 | `mikefarah/yq` | `v4.54.1` | Installed by `install` from GitHub releases, SHA-256 verified. |
-| Authelia image | `authelia/authelia:4.39.28` | Deployed by `login-auth:init` as `auth-portal`. |
+| Authelia image | `authelia/authelia:4.38.19` | Deployed by `login-auth:init` as `auth-portal`. |
 
 To update a pin: bump the version and the corresponding SHA-256 in `install`
 (for `yq`), update the image tag in `functions` (for Authelia), and adjust this

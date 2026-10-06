@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# install trigger for the login-auth Dokku plugin.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+if [[ -n "${PLUGIN_CORE_AVAILABLE_PATH:-}" ]] && [[ -f "$PLUGIN_CORE_AVAILABLE_PATH/common/functions" ]]; then
+  # shellcheck source=/dev/null
+  source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+fi
+
+LOGIN_AUTH_INSTALL_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$LOGIN_AUTH_INSTALL_PLUGIN_DIR/functions"
+
+# Pinned upstream dependency (see README for the update procedure).
+
+fn-login-auth-install-yq() {
+  declare desc="install mikefarah's yq v4 when missing or when the wrong yq is present"
+
+  if command -v yq >/dev/null 2>&1 && yq --version 2>&1 | grep -qi 'mikefarah'; then
+    return 0
+  fi
+
+  local arch expected url tmp
+  case "$(uname -m)" in
+    x86_64) arch="amd64" ;;
+    aarch64 | arm64) arch="arm64" ;;
+    *)
+      dokku_log_fail "unsupported architecture for yq: $(uname -m)"
+      ;;
+  esac
+  expected="$(fn-login-auth-yq-sha256 "$arch")"
+  url="https://github.com/mikefarah/yq/releases/download/${LOGIN_AUTH_YQ_VERSION}/yq_linux_${arch}"
+  tmp="$(mktemp)"
+  dokku_log_info1 "Installing yq ${LOGIN_AUTH_YQ_VERSION} (${arch})..."
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    dokku_log_fail "failed to download yq from $url"
+  fi
+  if ! printf '%s  %s\n' "$expected" "$tmp" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$tmp"
+    dokku_log_fail "yq checksum verification failed for $url"
+  fi
+  install -m 0755 "$tmp" /usr/local/bin/yq
+  rm -f "$tmp"
+}
+
+fn-login-auth-install-check-openssl() {
+  declare desc="verify openssl is available"
+
+  if ! command -v openssl >/dev/null 2>&1; then
+    dokku_log_fail "openssl is required (secret generation) but was not found; install it and re-run 'dokku plugin:install'"
+  fi
+}
+
+fn-login-auth-install-check-headers-more() {
+  declare desc="fail clearly when the headers-more module is missing"
+
+  if ! fn-login-auth-has-headers-more; then
+    dokku_log_fail "the nginx headers-more module (ngx_http_headers_more_filter_module) is required for identity propagation but was not detected; install it (e.g. 'apt-get install -y libnginx-mod-http-headers-more-filter' on Debian/Ubuntu), reload nginx, then re-run 'dokku plugin:install'"
+  fi
+}
+
+trigger-login-auth-install() {
+  declare desc="installs the login-auth plugin"
+  declare trigger="install"
+
+  fn-login-auth-install-check-openssl
+  fn-login-auth-install-yq
+  fn-login-auth-install-check-headers-more
+  fn-login-auth-ensure-dirs
+  dokku_log_info1 "login-auth installed"
+}
+
+trigger-login-auth-install "$@"

@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+# Command implementations for the login-auth Dokku plugin.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+if [[ -n "${PLUGIN_CORE_AVAILABLE_PATH:-}" ]] && [[ -f "$PLUGIN_CORE_AVAILABLE_PATH/common/functions" ]]; then
+  # shellcheck source=/dev/null
+  source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+fi
+
+LOGIN_AUTH_COMMAND_FUNCTIONS_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$LOGIN_AUTH_COMMAND_FUNCTIONS_PLUGIN_DIR/functions"
+
+# ---------------------------------------------------------------------------
+# Argument parsing helpers
+# ---------------------------------------------------------------------------
+
+fn-login-auth-parse-enable-args() {
+  declare desc="parse <app> [--path <p>] [--force]"
+  LOGIN_AUTH_ARG_APP=""
+  LOGIN_AUTH_ARG_PATH="/"
+  LOGIN_AUTH_ARG_PATH_GIVEN="false"
+  LOGIN_AUTH_ARG_FORCE="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path)
+        [[ $# -ge 2 ]] || dokku_log_fail "--path requires a value"
+        LOGIN_AUTH_ARG_PATH="$2"
+        LOGIN_AUTH_ARG_PATH_GIVEN="true"
+        shift 2
+        ;;
+      --path=*)
+        LOGIN_AUTH_ARG_PATH="${1#*=}"
+        LOGIN_AUTH_ARG_PATH_GIVEN="true"
+        shift
+        ;;
+      --force)
+        LOGIN_AUTH_ARG_FORCE="true"
+        shift
+        ;;
+      -*)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$LOGIN_AUTH_ARG_APP" ]]; then
+          LOGIN_AUTH_ARG_APP="$1"
+        else
+          dokku_log_fail "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$LOGIN_AUTH_ARG_APP" ]] || dokku_log_fail "Please specify an app"
+  verify_app_name "$LOGIN_AUTH_ARG_APP"
+}
+
+fn-login-auth-parse-disable-args() {
+  declare desc="parse <app> [--path <p>]"
+  LOGIN_AUTH_ARG_APP=""
+  LOGIN_AUTH_ARG_PATH="/"
+  LOGIN_AUTH_ARG_PATH_GIVEN="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path)
+        [[ $# -ge 2 ]] || dokku_log_fail "--path requires a value"
+        LOGIN_AUTH_ARG_PATH="$2"
+        LOGIN_AUTH_ARG_PATH_GIVEN="true"
+        shift 2
+        ;;
+      --path=*)
+        LOGIN_AUTH_ARG_PATH="${1#*=}"
+        LOGIN_AUTH_ARG_PATH_GIVEN="true"
+        shift
+        ;;
+      -*)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$LOGIN_AUTH_ARG_APP" ]]; then
+          LOGIN_AUTH_ARG_APP="$1"
+        else
+          dokku_log_fail "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$LOGIN_AUTH_ARG_APP" ]] || dokku_log_fail "Please specify an app"
+  verify_app_name "$LOGIN_AUTH_ARG_APP"
+}
+
+fn-login-auth-normalize-or-fail() {
+  declare desc="normalize a path prefix or fail before any write"
+  local raw="$1"
+  fn-login-auth-normalize-path "$raw"
+}
+
+# ---------------------------------------------------------------------------
+# enable / disable / bypass
+# ---------------------------------------------------------------------------
+
+fn-login-auth-enable() {
+  declare desc="enable a mode (form|apikey) for an app path"
+  declare MODE="$1"
+  shift
+  fn-login-auth-parse-enable-args "$@"
+
+  if [[ "$MODE" == "apikey" && "$LOGIN_AUTH_ARG_PATH_GIVEN" != "true" ]]; then
+    dokku_log_fail "--path is required for login-auth:enable-apikey"
+  fi
+
+  local app="$LOGIN_AUTH_ARG_APP"
+  local path
+  path="$(fn-login-auth-normalize-or-fail "$LOGIN_AUTH_ARG_PATH")" || \
+    dokku_log_fail "Invalid --path '$LOGIN_AUTH_ARG_PATH': a path prefix must start with '/'"
+
+  # SPEC §6.6: fail before writing any state/config when auth-portal is missing.
+  fn-login-auth-require-upstream >/dev/null
+
+  local prev existing
+  prev="$(fn-login-auth-state-read "$app")"
+  existing="$(fn-login-auth-get-mode "$app" "$path")"
+  if [[ -n "$existing" ]]; then
+    if [[ "$existing" == "$MODE" ]]; then
+      dokku_log_info1 "Path $path is already configured as $MODE for $app; nothing to do"
+      return 0
+    fi
+    if [[ "$LOGIN_AUTH_ARG_FORCE" != "true" ]]; then
+      dokku_log_fail "path $path already configured as $existing; disable it first (or pass --force)"
+    fi
+  fi
+
+  fn-login-auth-set-path "$app" "$path" "$MODE"
+  fn-login-auth-commit "$app" "$prev"
+  dokku_log_info1 "Enabled $MODE authentication for $app at $path"
+}
+
+fn-login-auth-disable() {
+  declare desc="disable a mode (form|apikey) for an app path"
+  declare MODE="$1"
+  shift
+  fn-login-auth-parse-disable-args "$@"
+
+  local app="$LOGIN_AUTH_ARG_APP"
+  local path
+  path="$(fn-login-auth-normalize-or-fail "$LOGIN_AUTH_ARG_PATH")" || \
+    dokku_log_fail "Invalid --path '$LOGIN_AUTH_ARG_PATH': a path prefix must start with '/'"
+
+  local prev existing
+  prev="$(fn-login-auth-state-read "$app")"
+  existing="$(fn-login-auth-get-mode "$app" "$path")"
+  if [[ -z "$existing" ]]; then
+    dokku_log_info1 "Path $path is not configured for $app; nothing to do"
+    return 0
+  fi
+  if [[ "$existing" != "$MODE" ]]; then
+    dokku_log_info1 "Path $path is configured as $existing (not $MODE) for $app; nothing to do"
+    return 0
+  fi
+
+  fn-login-auth-remove-path "$app" "$path"
+  fn-login-auth-commit "$app" "$prev"
+  dokku_log_info1 "Disabled $MODE authentication for $app at $path"
+}
+
+fn-login-auth-bypass() {
+  declare desc="mark an app path explicitly public (none mode)"
+  fn-login-auth-parse-enable-args "$@"
+
+  local app="$LOGIN_AUTH_ARG_APP"
+  local path
+  path="$(fn-login-auth-normalize-or-fail "$LOGIN_AUTH_ARG_PATH")" || \
+    dokku_log_fail "Invalid --path '$LOGIN_AUTH_ARG_PATH': a path prefix must start with '/'"
+
+  fn-login-auth-require-upstream >/dev/null
+
+  local prev existing
+  prev="$(fn-login-auth-state-read "$app")"
+  existing="$(fn-login-auth-get-mode "$app" "$path")"
+  if [[ "$existing" == "none" ]]; then
+    dokku_log_info1 "Path $path is already public for $app; nothing to do"
+    return 0
+  fi
+  if [[ -n "$existing" && "$LOGIN_AUTH_ARG_FORCE" != "true" ]]; then
+    dokku_log_fail "path $path already configured as $existing; disable it first (or pass --force)"
+  fi
+
+  fn-login-auth-set-path "$app" "$path" "none"
+  fn-login-auth-commit "$app" "$prev"
+  dokku_log_info1 "Bypassed authentication for $app at $path"
+}
+
+# ---------------------------------------------------------------------------
+# API keys
+# ---------------------------------------------------------------------------
+
+cmd-login-auth-add-key() {
+  declare desc="add or replace an API key for an app"
+  declare cmd="login-auth:add-key"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local app="" key_name="" key_value="" from_stdin="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from-stdin)
+        from_stdin="true"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$app" ]]; then
+          app="$1"
+        elif [[ -z "$key_name" ]]; then
+          key_name="$1"
+        elif [[ -z "$key_value" ]]; then
+          key_value="$1"
+        else
+          dokku_log_fail "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$app" ]] || dokku_log_fail "Missing app"
+  [[ -n "$key_name" ]] || dokku_log_fail "Missing key name"
+  verify_app_name "$app"
+
+  if [[ "$from_stdin" == "true" ]]; then
+    IFS= read -r key_value || true
+  fi
+  [[ -n "$key_value" ]] || dokku_log_fail "Missing key value (pass it as an argument or via --from-stdin)"
+
+  fn-login-auth-require-upstream >/dev/null
+  if ! fn-login-auth-has-mode "$app" apikey; then
+    dokku_log_fail "no apikey path is configured for $app; run 'dokku login-auth:enable-apikey $app --path <prefix>' first"
+  fi
+
+  local prev
+  prev="$(fn-login-auth-state-read "$app")"
+  fn-login-auth-add-key "$app" "$key_name" "$key_value"
+  fn-login-auth-commit "$app" "$prev"
+  dokku_log_info1 "Added API key '$key_name' for $app"
+}
+
+cmd-login-auth-remove-key() {
+  declare desc="remove an API key from an app"
+  declare cmd="login-auth:remove-key"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local app="${1:-}" key_name="${2:-}"
+  [[ -n "$app" ]] || dokku_log_fail "Missing app"
+  [[ -n "$key_name" ]] || dokku_log_fail "Missing key name"
+  verify_app_name "$app"
+
+  if ! fn-login-auth-remove-key "$app" "$key_name"; then
+    dokku_log_fail "API key '$key_name' not found for $app"
+  fi
+  fn-login-auth-render-global
+  if fn-login-auth-has-paths "$app"; then
+    fn-login-auth-validate-app "$app" || dokku_log_fail "nginx configuration for $app is invalid after removing key"
+  fi
+  fn-login-auth-reload
+  dokku_log_info1 "Removed API key '$key_name' for $app"
+}
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+cmd-login-auth-user-add() {
+  declare desc="add a user to the auth-portal users file"
+  declare cmd="login-auth:user-add"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local username="${1:-}"
+  shift || true
+  local password="${1:-}"
+  shift || true
+  local displayname="" email=""
+  local -a groups=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --group)
+        [[ $# -ge 2 ]] || dokku_log_fail "--group requires a value"
+        groups+=("$2")
+        shift 2
+        ;;
+      --group=*)
+        groups+=("${1#*=}")
+        shift
+        ;;
+      --displayname)
+        displayname="${2:-}"
+        shift 2
+        ;;
+      --displayname=*)
+        displayname="${1#*=}"
+        shift
+        ;;
+      --email)
+        email="${2:-}"
+        shift 2
+        ;;
+      --email=*)
+        email="${1#*=}"
+        shift
+        ;;
+      *)
+        dokku_log_fail "Unexpected argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$username" ]] || dokku_log_fail "Missing username"
+  [[ -n "$password" ]] || dokku_log_fail "Missing password"
+
+  fn-login-auth-require-yq
+  fn-login-auth-ensure-users-file
+  if fn-login-auth-user-exists "$username"; then
+    dokku_log_fail "user '$username' already exists; use login-auth:user-passwd to change the password"
+  fi
+
+  local hash
+  hash="$(fn-login-auth-hash-password "$password")" || dokku_log_fail "failed to generate a password hash (is auth-portal running?)"
+
+  fn-login-auth-user-create "$username" "$hash" "$displayname" "$email" "${groups[@]}"
+  fn-login-auth-restart-auth-portal
+  dokku_log_info1 "Added user '$username'"
+}
+
+cmd-login-auth-user-remove() {
+  declare desc="remove a user from the auth-portal users file"
+  declare cmd="login-auth:user-remove"
+  [[ "$1" == "$cmd" ]] && shift 1
+  local username="${1:-}"
+  [[ -n "$username" ]] || dokku_log_fail "Missing username"
+
+  fn-login-auth-require-yq
+  fn-login-auth-ensure-users-file
+  if ! fn-login-auth-user-exists "$username"; then
+    dokku_log_warn "user '$username' does not exist; nothing to do"
+    return 0
+  fi
+  fn-login-auth-user-delete "$username"
+  fn-login-auth-restart-auth-portal
+  dokku_log_info1 "Removed user '$username'"
+}
+
+cmd-login-auth-user-passwd() {
+  declare desc="change a user's password"
+  declare cmd="login-auth:user-passwd"
+  [[ "$1" == "$cmd" ]] && shift 1
+  local username="${1:-}" password="${2:-}"
+  [[ -n "$username" ]] || dokku_log_fail "Missing username"
+  [[ -n "$password" ]] || dokku_log_fail "Missing password"
+
+  fn-login-auth-require-yq
+  fn-login-auth-ensure-users-file
+  if ! fn-login-auth-user-exists "$username"; then
+    dokku_log_fail "user '$username' does not exist"
+  fi
+
+  local hash
+  hash="$(fn-login-auth-hash-password "$password")" || dokku_log_fail "failed to generate a password hash (is auth-portal running?)"
+  fn-login-auth-user-set-field "$username" "password" "$hash"
+  fn-login-auth-restart-auth-portal
+  dokku_log_info1 "Updated password for user '$username'"
+}
+
+cmd-login-auth-user-list() {
+  declare desc="list users without exposing password hashes"
+  declare cmd="login-auth:user-list"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  fn-login-auth-require-yq
+  fn-login-auth-ensure-users-file
+  local file
+  file="$(fn-login-auth-users-file)"
+  yq eval -r '
+    .users // {} | to_entries | .[] |
+    .key + "\t" + (.value.displayname // "") + "\t" + (.value.email // "") +
+    "\t" + ((.value.groups // []) | join(","))
+  ' "$file"
+}
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+cmd-login-auth-init() {
+  declare desc="one-time setup of the auth-portal app"
+  declare cmd="login-auth:init"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local parent_domain="" auth_subdomain="auth" force="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --parent-domain)
+        parent_domain="${2:-}"
+        shift 2
+        ;;
+      --parent-domain=*)
+        parent_domain="${1#*=}"
+        shift
+        ;;
+      --auth-subdomain)
+        auth_subdomain="${2:-}"
+        shift 2
+        ;;
+      --auth-subdomain=*)
+        auth_subdomain="${1#*=}"
+        shift
+        ;;
+      --force)
+        force="true"
+        shift
+        ;;
+      *)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+    esac
+  done
+
+  fn-login-auth-ensure-dirs
+
+  local existing_parent existing_sub
+  existing_parent="$(fn-login-auth-parent-domain)"
+  existing_sub="$(fn-login-auth-auth-subdomain)"
+  if [[ -z "$parent_domain" ]]; then
+    parent_domain="$existing_parent"
+  fi
+  if [[ -z "$parent_domain" ]]; then
+    dokku_log_fail "--parent-domain is required on the first run"
+  fi
+  [[ "$auth_subdomain" == "auth" && -n "$existing_sub" ]] && auth_subdomain="$existing_sub"
+
+  local config_root users_file config_file auth_domain
+  config_root="$(fn-login-auth-config-root)"
+  users_file="$config_root/users.yml"
+  config_file="$config_root/configuration.yml"
+  auth_domain="$auth_subdomain.$parent_domain"
+
+  dokku_log_info1 "Setting up auth-portal..."
+
+  if ! dokku apps:exists "$LOGIN_AUTH_AUTH_PORTAL_APP" >/dev/null 2>&1; then
+    dokku apps:create "$LOGIN_AUTH_AUTH_PORTAL_APP"
+  fi
+  dokku ports:set "$LOGIN_AUTH_AUTH_PORTAL_APP" http:80:9091 https:443:9091 >/dev/null
+
+  mkdir -p "$config_root"
+  chown -R 1000:1000 "$(dirname "$config_root")" 2>/dev/null || true
+
+  if ! dokku storage:list "$LOGIN_AUTH_AUTH_PORTAL_APP" 2>/dev/null | grep -q ":$config_root"; then
+    dokku storage:mount "$LOGIN_AUTH_AUTH_PORTAL_APP" "$config_root:/config" >/dev/null 2>&1 || \
+      dokku_log_warn "could not mount storage; mount it manually: dokku storage:mount $LOGIN_AUTH_AUTH_PORTAL_APP $config_root:/config"
+  fi
+
+  if [[ ! -f "$config_file" ]] || [[ "$force" == "true" ]]; then
+    local jwt_secret session_secret storage_secret
+    jwt_secret="$(openssl rand -hex 32)"
+    session_secret="$(openssl rand -hex 32)"
+    storage_secret="$(openssl rand -hex 32)"
+    fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/configuration.yml.template" \
+      "PARENT_DOMAIN=$parent_domain" \
+      "JWT_SECRET=$jwt_secret" \
+      "SESSION_SECRET=$session_secret" \
+      "STORAGE_SECRET=$storage_secret" >"$config_file"
+    chmod 0600 "$config_file" 2>/dev/null || true
+    dokku_log_info1 "Wrote $config_file"
+  else
+    dokku_log_info1 "Keeping existing $config_file (use --force to overwrite)"
+  fi
+
+  if [[ ! -f "$users_file" ]]; then
+    fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/users.yml.template" >"$users_file"
+    chmod 0600 "$users_file" 2>/dev/null || true
+  fi
+
+  dokku domains:set "$LOGIN_AUTH_AUTH_PORTAL_APP" "$auth_domain" >/dev/null
+
+  if fn-login-auth-auth-portal-deployed; then
+    dokku ps:restart "$LOGIN_AUTH_AUTH_PORTAL_APP"
+  else
+    dokku git:from-image "$LOGIN_AUTH_AUTH_PORTAL_APP" "$LOGIN_AUTH_AUTHELIA_IMAGE"
+  fi
+
+  local gstate
+  gstate="$(jq -n \
+    --arg parent "$parent_domain" \
+    --arg sub "$auth_subdomain" \
+    --arg version "$LOGIN_AUTH_AUTHELIA_IMAGE" \
+    '{parent_domain: $parent, auth_subdomain: $sub, authelia_image: $version}')"
+  fn-login-auth-global-state-write "$gstate"
+
+  dokku_log_info1 "auth-portal configured"
+  dokku_log_verbose "App:           $LOGIN_AUTH_AUTH_PORTAL_APP"
+  dokku_log_verbose "Domain:        $auth_domain"
+  dokku_log_verbose "Storage:       $config_root"
+  dokku_log_verbose "Reminder:      run 'dokku login-auth:user-add <user> <password>' to create the first user"
+}
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+fn-login-auth-report-single-json() {
+  declare desc="emit a single app's login-auth state as JSON"
+  declare APP="$1"
+  local upstream
+  upstream="$(fn-login-auth-resolve-upstream 2>/dev/null || true)"
+  jq -n \
+    --arg app "$APP" \
+    --arg upstream "$upstream" \
+    --argjson paths "$(fn-login-auth-state-read "$APP" | jq '.paths // []')" \
+    '{
+      app: $app,
+      auth_portal_upstream: (if $upstream == "" then null else $upstream end),
+      paths: ($paths | map({path: .path, mode: .mode, target: (
+        if .mode == "form" then "auth_request:authelia"
+        elif .mode == "apikey" then "auth_request:apikey"
+        else "public" end)}))
+    }'
+}
+
+fn-login-auth-report-single-text() {
+  declare desc="emit a single app's login-auth state as text"
+  declare APP="$1"
+  local upstream path mode
+  upstream="$(fn-login-auth-resolve-upstream 2>/dev/null || true)"
+  [[ -n "$upstream" ]] || upstream="(missing)"
+
+  dokku_log_info2_quiet "${APP} login-auth information"
+  dokku_log_verbose "$(printf '%-24s %s' "Auth-portal upstream:" "$upstream")"
+  while IFS=$'\t' read -r mode path; do
+    [[ -n "$path" ]] || continue
+    dokku_log_verbose "$(printf '%-24s %s' "$mode:" "$path")"
+  done < <(fn-login-auth-list-paths "$APP")
+}
+
+cmd-login-auth-report() {
+  declare desc="show login-auth configuration for one or all apps"
+  declare cmd="login-auth:report"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local app="" format="stdout"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format)
+        format="${2:-}"
+        shift 2
+        ;;
+      --format=*)
+        format="${1#*=}"
+        shift
+        ;;
+      -*)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+      *)
+        app="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -n "$app" ]]; then
+    verify_app_name "$app"
+    if [[ "$format" == "json" ]]; then
+      fn-login-auth-report-single-json "$app"
+    else
+      fn-login-auth-report-single-text "$app"
+    fi
+    return
+  fi
+
+  if [[ "$format" == "json" ]]; then
+    local first="true" configured
+    printf '['
+    while IFS= read -r configured; do
+      [[ -n "$configured" ]] || continue
+      [[ "$first" == "true" ]] || printf ','
+      first="false"
+      fn-login-auth-report-single-json "$configured" | tr -d '\n'
+    done < <(fn-login-auth-list-configured-apps)
+    printf ']\n'
+    return
+  fi
+
+  local configured
+  while IFS= read -r configured; do
+    [[ -n "$configured" ]] || continue
+    fn-login-auth-report-single-text "$configured"
+  done < <(fn-login-auth-list-configured-apps)
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand entry points (called by subcommands/*)
+# ---------------------------------------------------------------------------
+
+cmd-login-auth-enable-form() {
+  declare desc="protect an app or path with form login + SSO"
+  declare cmd="login-auth:enable-form"
+  [[ "$1" == "$cmd" ]] && shift 1
+  fn-login-auth-enable "form" "$@"
+}
+
+cmd-login-auth-disable-form() {
+  declare desc="remove form-login protection for an app or path"
+  declare cmd="login-auth:disable-form"
+  [[ "$1" == "$cmd" ]] && shift 1
+  fn-login-auth-disable "form" "$@"
+}
+
+cmd-login-auth-enable-apikey() {
+  declare desc="protect an app path with API keys"
+  declare cmd="login-auth:enable-apikey"
+  [[ "$1" == "$cmd" ]] && shift 1
+  fn-login-auth-enable "apikey" "$@"
+}
+
+cmd-login-auth-disable-apikey() {
+  declare desc="remove API-key protection for an app path"
+  declare cmd="login-auth:disable-apikey"
+  [[ "$1" == "$cmd" ]] && shift 1
+  fn-login-auth-disable "apikey" "$@"
+}
+
+cmd-login-auth-bypass() {
+  declare desc="mark an app path explicitly public"
+  declare cmd="login-auth:bypass"
+  [[ "$1" == "$cmd" ]] && shift 1
+  fn-login-auth-bypass "$@"
+}

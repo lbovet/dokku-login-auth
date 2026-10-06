@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Clean up login-auth state and generated config when an app is deleted.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+if [[ -n "${PLUGIN_CORE_AVAILABLE_PATH:-}" ]] && [[ -f "$PLUGIN_CORE_AVAILABLE_PATH/common/functions" ]]; then
+  # shellcheck source=/dev/null
+  source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+fi
+
+LOGIN_AUTH_POST_DELETE_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$LOGIN_AUTH_POST_DELETE_PLUGIN_DIR/functions"
+
+trigger-login-auth-post-delete() {
+  declare desc="removes login-auth state and generated nginx config for a deleted app"
+  declare trigger="post-delete"
+  declare APP="$1"
+
+  [[ -n "$APP" ]] || return 0
+
+  fn-login-auth-remove-app-config "$APP" >/dev/null 2>&1 || true
+  fn-login-auth-render-global >/dev/null 2>&1 || true
+  return 0
+}
+
+trigger-login-auth-post-delete "$@"

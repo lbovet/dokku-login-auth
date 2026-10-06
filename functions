@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+# Shared helper functions for the login-auth Dokku plugin.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+# Plugin root: the directory containing this file (also holds templates/).
+LOGIN_AUTH_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${DOKKU_ROOT:=/home/dokku}"
+: "${DOKKU_LIB_ROOT:=/var/lib/dokku}"
+: "${PLUGIN_AVAILABLE_PATH:=$(cd "$LOGIN_AUTH_PLUGIN_DIR/.." && pwd)}"
+
+LOGIN_AUTH_SERVICE_ROOT="$DOKKU_LIB_ROOT/services/login-auth"
+LOGIN_AUTH_GLOBAL_STATE_DIR="$LOGIN_AUTH_SERVICE_ROOT/_global"
+LOGIN_AUTH_GLOBAL_STATE_FILE="$LOGIN_AUTH_GLOBAL_STATE_DIR/state.json"
+LOGIN_AUTH_NGINX_ROOT="/etc/nginx/login-auth"
+LOGIN_AUTH_GLOBAL_CONF="/etc/nginx/conf.d/00-login-auth-routing.conf"
+LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER="/etc/nginx/conf.d/00-login-auth-routing.conf"
+LOGIN_AUTH_AUTHELIA_IMAGE="authelia/authelia:4.38.19"
+LOGIN_AUTH_YQ_VERSION="v4.54.1"
+LOGIN_AUTH_AUTH_PORTAL_APP="auth-portal"
+LOGIN_AUTH_MANAGED_HEADER="# Managed by dokku-login-auth. Do not edit manually."
+LOGIN_AUTH_NO_UPSTREAM_MSG="auth-portal app not found or has no web upstream; deploy auth-portal first (see SPEC.md §4)"
+
+# ---------------------------------------------------------------------------
+# Logging fallbacks (only used when run outside of Dokku, e.g. in unit tests)
+# ---------------------------------------------------------------------------
+if ! command -v dokku_log_info1 >/dev/null 2>&1; then
+  dokku_log_info1() { echo "-----> $*"; }
+  dokku_log_info2() { echo "=====> $*"; }
+  dokku_log_info2_quiet() { :; }
+  dokku_log_verbose() { echo "       $*"; }
+  dokku_log_warn() { echo " !     $*" >&2; }
+  dokku_log_error() { echo " !     $*" >&2; }
+  dokku_log_fail() {
+    echo " !     $*" >&2
+    exit 1
+  }
+fi
+
+# ---------------------------------------------------------------------------
+# Basic helpers
+# ---------------------------------------------------------------------------
+
+fn-login-auth-sanitize-app() {
+  declare desc="convert an app name into an nginx-safe identifier"
+  declare APP="$1"
+
+  printf '%s' "${APP//-/_}"
+}
+
+fn-login-auth-normalize-path() {
+  declare desc="normalize a literal path prefix (requires a leading slash)"
+  local path="$1"
+
+  [[ -n "$path" ]] || return 1
+  [[ "$path" == /* ]] || return 1
+  while [[ "$path" != "/" && "$path" == */ ]]; do
+    path="${path%/}"
+  done
+  printf '%s' "$path"
+}
+
+fn-login-auth-valid-mode() {
+  declare desc="check whether a mode is one of form/apikey/none"
+  case "$1" in
+    form | apikey | none) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fn-login-auth-regex-escape() {
+  declare desc="escape regex metacharacters in a literal path prefix"
+  printf '%s' "$1" | sed -e 's/[][\.|$(){}?+*^]/\\&/g'
+}
+
+fn-login-auth-ensure-dirs() {
+  declare desc="create the plugin's base directories"
+  mkdir -p "$LOGIN_AUTH_SERVICE_ROOT" "$LOGIN_AUTH_NGINX_ROOT"
+  if [[ ! -f "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER" ]]; then
+    mkdir -p "$(dirname "$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER")"
+    printf '%s\n' "$LOGIN_AUTH_MANAGED_HEADER" >"$LOGIN_AUTH_GLOBAL_CONF_PLACEHOLDER"
+  fi
+}
+
+fn-login-auth-apikey-dir() {
+  declare desc="nginx-readable directory holding an app's API-key map"
+  declare APP="$1"
+
+  printf '%s/%s' "$LOGIN_AUTH_NGINX_ROOT" "$APP"
+}
+
+fn-login-auth-apikey-map-path() {
+  declare desc="path to an app's API-key value map file"
+  declare APP="$1"
+
+  printf '%s/apikeys.map' "$(fn-login-auth-apikey-dir "$APP")"
+}
+
+fn-login-auth-state-dir() {
+  declare desc="directory holding an app's login-auth state"
+  declare APP="$1"
+
+  printf '%s/%s' "$LOGIN_AUTH_SERVICE_ROOT" "$APP"
+}
+
+fn-login-auth-state-file() {
+  declare desc="path to an app's login-auth state file"
+  declare APP="$1"
+
+  printf '%s/state.json' "$(fn-login-auth-state-dir "$APP")"
+}
+
+fn-login-auth-config-root() {
+  declare desc="authelia config directory (dokku storage mount)"
+
+  printf '%s/data/storage/auth-portal/config' "$DOKKU_LIB_ROOT"
+}
+
+# ---------------------------------------------------------------------------
+# auth-portal upstream resolution (SPEC §6.6)
+# ---------------------------------------------------------------------------
+
+fn-login-auth-resolve-upstream() {
+  declare desc="resolve the dokku-generated upstream name for auth-portal"
+  local json port
+
+  json="$(dokku ports:report "$LOGIN_AUTH_AUTH_PORTAL_APP" --ports-map-json 2>/dev/null || true)"
+  port="$(printf '%s' "$json" | jq -r '.[0].container_port // empty' 2>/dev/null || true)"
+  if [[ -z "$port" ]]; then
+    json="$(dokku ports:report "$LOGIN_AUTH_AUTH_PORTAL_APP" --ports-map-detected-json 2>/dev/null || true)"
+    port="$(printf '%s' "$json" | jq -r '.[0].container_port // empty' 2>/dev/null || true)"
+  fi
+  if [[ -z "$port" ]]; then
+    # Text fallback: scheme:host_port:container_port (third field).
+    port="$(dokku ports:report "$LOGIN_AUTH_AUTH_PORTAL_APP" --ports-map 2>/dev/null | awk 'NF>=3 {print $3; exit}' || true)"
+  fi
+  [[ -n "$port" ]] || return 1
+  printf '%s-%s' "$LOGIN_AUTH_AUTH_PORTAL_APP" "$port"
+}
+
+fn-login-auth-require-upstream() {
+  declare desc="fail clearly when auth-portal has no resolvable upstream"
+  local upstream
+  upstream="$(fn-login-auth-resolve-upstream)" || {
+    dokku_log_fail "$LOGIN_AUTH_NO_UPSTREAM_MSG"
+  }
+  [[ -n "$upstream" ]] || dokku_log_fail "$LOGIN_AUTH_NO_UPSTREAM_MSG"
+  printf '%s' "$upstream"
+}
+
+# ---------------------------------------------------------------------------
+# Per-app state (JSON, atomic)
+# ---------------------------------------------------------------------------
+
+fn-login-auth-state-read() {
+  declare desc="emit an app's current state as normalized JSON"
+  declare APP="$1"
+  local file
+  file="$(fn-login-auth-state-file "$APP")"
+
+  if [[ -f "$file" ]]; then
+    jq --arg app "$APP" '.app = $app | .paths = (.paths // [])' "$file"
+  else
+    jq -n --arg app "$APP" '{app: $app, paths: []}'
+  fi
+}
+
+fn-login-auth-state-write() {
+  declare desc="atomically write an app's state JSON"
+  declare APP="$1" JSON="$2"
+  local dir tmp
+  dir="$(fn-login-auth-state-dir "$APP")"
+  mkdir -p "$dir"
+  tmp="$dir/state.json.tmp"
+  printf '%s\n' "$JSON" >"$tmp"
+  mv "$tmp" "$dir/state.json"
+}
+
+fn-login-auth-state-exists() {
+  declare desc="check whether an app has a state file"
+  declare APP="$1"
+
+  [[ -f "$(fn-login-auth-state-file "$APP")" ]]
+}
+
+fn-login-auth-has-paths() {
+  declare desc="check whether an app has at least one configured path"
+  declare APP="$1"
+
+  fn-login-auth-state-read "$APP" | jq -e '(.paths | length) > 0' >/dev/null 2>&1
+}
+
+fn-login-auth-has-mode() {
+  declare desc="check whether an app has at least one path in a given mode"
+  declare APP="$1" MODE="$2"
+
+  fn-login-auth-state-read "$APP" | jq -e --arg mode "$MODE" 'any(.paths[]?; .mode == $mode)' >/dev/null 2>&1
+}
+
+fn-login-auth-get-mode() {
+  declare desc="emit the mode configured for a path (empty when unset)"
+  declare APP="$1" PATH_PREFIX="$2"
+
+  fn-login-auth-state-read "$APP" | jq -r --arg p "$PATH_PREFIX" '.paths[]? | select(.path == $p) | .mode' | head -n1
+}
+
+fn-login-auth-list-paths() {
+  declare desc="emit mode<TAB>path for every configured path (longest first)"
+  declare APP="$1"
+
+  fn-login-auth-state-read "$APP" | jq -r '.paths[]? | "\(.mode)\t\(.path)"'
+}
+
+fn-login-auth-set-path() {
+  declare desc="insert or overwrite a path/mode entry in the app state"
+  declare APP="$1" PATH_PREFIX="$2" MODE="$3"
+  local json
+  json="$(fn-login-auth-state-read "$APP" | jq --arg app "$APP" --arg p "$PATH_PREFIX" --arg m "$MODE" '
+    .app = $app
+    | .paths = ((.paths // []) | map(select(.path != $p)))
+    | .paths += [{"path": $p, "mode": $m}]
+    | .paths |= sort_by(-(.path | length))
+  ')"
+  fn-login-auth-state-write "$APP" "$json"
+}
+
+fn-login-auth-remove-path() {
+  declare desc="remove a path entry from the app state"
+  declare APP="$1" PATH_PREFIX="$2"
+  local json
+  json="$(fn-login-auth-state-read "$APP" | jq --arg app "$APP" --arg p "$PATH_PREFIX" '
+    .app = $app
+    | .paths = ((.paths // []) | map(select(.path != $p)))
+  ')"
+  fn-login-auth-state-write "$APP" "$json"
+}
+
+fn-login-auth-list-configured-apps() {
+  declare desc="list apps that have at least one login-auth path configured"
+  local dir app
+  for dir in "$LOGIN_AUTH_SERVICE_ROOT"/*/; do
+    [[ -d "$dir" ]] || continue
+    app="$(basename "$dir")"
+    [[ "$app" == "_global" ]] && continue
+    fn-login-auth-has-paths "$app" && printf '%s\n' "$app"
+  done | sort
+}
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+fn-login-auth-global-state-read() {
+  declare desc="emit the global login-auth state as JSON"
+
+  if [[ -f "$LOGIN_AUTH_GLOBAL_STATE_FILE" ]]; then
+    cat "$LOGIN_AUTH_GLOBAL_STATE_FILE"
+  else
+    printf '%s\n' '{}'
+  fi
+}
+
+fn-login-auth-global-state-write() {
+  declare desc="atomically write the global login-auth state"
+  declare JSON="$1"
+  mkdir -p "$LOGIN_AUTH_GLOBAL_STATE_DIR"
+  printf '%s\n' "$JSON" >"$LOGIN_AUTH_GLOBAL_STATE_DIR/state.json.tmp"
+  mv "$LOGIN_AUTH_GLOBAL_STATE_DIR/state.json.tmp" "$LOGIN_AUTH_GLOBAL_STATE_FILE"
+}
+
+fn-login-auth-parent-domain() {
+  declare desc="emit the configured parent domain (empty when unset)"
+
+  fn-login-auth-global-state-read | jq -r '.parent_domain // empty'
+}
+
+fn-login-auth-auth-subdomain() {
+  declare desc="emit the configured auth subdomain (defaults to auth)"
+
+  local sub
+  sub="$(fn-login-auth-global-state-read | jq -r '.auth_subdomain // "auth"')"
+  [[ -n "$sub" ]] || sub="auth"
+  printf '%s' "$sub"
+}
+
+# ---------------------------------------------------------------------------
+# Template rendering
+# ---------------------------------------------------------------------------
+
+fn-login-auth-render-template() {
+  declare desc="render a template, replacing <KEY> tokens with literal values"
+  local template="$1"
+  shift
+  [[ -f "$template" ]] || {
+    dokku_log_error "template not found: $template"
+    return 1
+  }
+  local content pair key value
+  content="$(cat "$template")"
+  for pair in "$@"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    content="${content//<$key>/$value}"
+  done
+  printf '%s\n' "$content"
+}
+
+fn-login-auth-map-entry() {
+  declare desc="emit one routing-map regex entry for a literal path prefix"
+  declare PATH_PREFIX="$1" MODE="$2"
+
+  printf '    ~^%s(/|$)   "%s";\n' "$(fn-login-auth-regex-escape "$PATH_PREFIX")" "$MODE"
+}
+
+fn-login-auth-render-routing-block() {
+  declare desc="render the per-app routing map block (SPEC §6.2)"
+  declare APP="$1"
+  local sanitized default_mode entries path mode entry
+  sanitized="$(fn-login-auth-sanitize-app "$APP")"
+  default_mode="none"
+  entries=""
+  while IFS=$'\t' read -r mode path; do
+    [[ -z "$path" ]] && continue
+    if [[ "$path" == "/" ]]; then
+      default_mode="$mode"
+    else
+      entry="$(fn-login-auth-map-entry "$path" "$mode")"
+      entries+="$entry"$'\n'
+    fi
+  done < <(fn-login-auth-list-paths "$APP")
+
+  fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/routing-maps.conf.template" \
+    "APP=$APP" \
+    "APP_SANITIZED=$sanitized" \
+    "DEFAULT_MODE=$default_mode" \
+    "MAP_ENTRIES=${entries%$'\n'}"
+}
+
+fn-login-auth-render-apikey-block() {
+  declare desc="render the per-app API-key map block (SPEC §6.4.2)"
+  declare APP="$1"
+  local sanitized
+  sanitized="$(fn-login-auth-sanitize-app "$APP")"
+  # The include target must exist for nginx to load the generated map even
+  # before the first key is added.
+  fn-login-auth-ensure-apikey-map "$APP"
+
+  fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/apikey-map-block.conf.template" \
+    "APP=$APP" \
+    "APP_SANITIZED=$sanitized" \
+    "APIKEY_MAP_PATH=$(fn-login-auth-apikey-map-path "$APP")"
+}
+
+fn-login-auth-render-per-app() {
+  declare desc="render the per-app nginx include files (internal + server)"
+  declare APP="$1"
+  local sanitized upstream app_root
+  sanitized="$(fn-login-auth-sanitize-app "$APP")"
+  upstream="$(fn-login-auth-resolve-upstream)" || return 1
+  [[ -n "$upstream" ]] || return 1
+  app_root="$DOKKU_ROOT/$APP/nginx.conf.d"
+  mkdir -p "$app_root"
+
+  fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/internal-locations.conf.template" \
+    "APP_SANITIZED=$sanitized" \
+    "AUTH_PORTAL_UPSTREAM=$upstream" \
+    >"$app_root/login-auth-00-internal.conf"
+
+  fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/server-enforcement.conf.template" \
+    "APP_SANITIZED=$sanitized" \
+    >"$app_root/login-auth-10-server.conf"
+}
+
+fn-login-auth-render-global() {
+  declare desc="regenerate the global http-context routing/map file (SPEC §6.2/§6.4)"
+  local conf_dir tmp app
+  conf_dir="$(dirname "$LOGIN_AUTH_GLOBAL_CONF")"
+  mkdir -p "$conf_dir"
+  tmp="$(mktemp "$conf_dir/.login-auth-routing.XXXXXX")"
+  printf '%s\n\n' "$LOGIN_AUTH_MANAGED_HEADER" >"$tmp"
+
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    fn-login-auth-render-routing-block "$app" >>"$tmp"
+    printf '\n' >>"$tmp"
+    if fn-login-auth-has-mode "$app" apikey; then
+      fn-login-auth-render-apikey-block "$app" >>"$tmp"
+      printf '\n' >>"$tmp"
+    fi
+  done < <(fn-login-auth-list-configured-apps)
+
+  mv "$tmp" "$LOGIN_AUTH_GLOBAL_CONF"
+}
+
+# ---------------------------------------------------------------------------
+# Sync / validate / reload
+# ---------------------------------------------------------------------------
+
+fn-login-auth-remove-app-config() {
+  declare desc="remove all generated files and state for an app"
+  declare APP="$1"
+
+  rm -f "$DOKKU_ROOT/$APP/nginx.conf.d/"login-auth-*.conf 2>/dev/null || true
+  rm -rf "$(fn-login-auth-state-dir "$APP")" 2>/dev/null || true
+  rm -rf "$(fn-login-auth-apikey-dir "$APP")" 2>/dev/null || true
+}
+
+fn-login-auth-sync-app() {
+  declare desc="regenerate all generated config for a single app and the global file"
+  declare APP="$1"
+  local app_root
+  app_root="$DOKKU_ROOT/$APP/nginx.conf.d"
+  mkdir -p "$app_root"
+
+  if fn-login-auth-has-paths "$APP"; then
+    if [[ -z "$(fn-login-auth-resolve-upstream)" ]]; then
+      return 1
+    fi
+    rm -f "$app_root"/login-auth-*.conf
+    fn-login-auth-render-per-app "$APP" || return 1
+  else
+    rm -f "$app_root"/login-auth-*.conf
+    rm -f "$(fn-login-auth-state-file "$APP")" 2>/dev/null || true
+    rmdir "$(fn-login-auth-state-dir "$APP")" 2>/dev/null || true
+    rm -rf "$(fn-login-auth-apikey-dir "$APP")" 2>/dev/null || true
+  fi
+  fn-login-auth-render-global
+}
+
+fn-login-auth-validate-app() {
+  declare desc="validate the nginx configuration for an app"
+  declare APP="$1"
+
+  dokku nginx:validate-config "$APP"
+}
+
+fn-login-auth-reload() {
+  declare desc="reload nginx"
+
+  dokku nginx:reload
+}
+
+fn-login-auth-restore() {
+  declare desc="restore a previous state and re-render, best effort"
+  declare APP="$1" PREV_STATE="$2"
+
+  fn-login-auth-state-write "$APP" "$PREV_STATE"
+  if fn-login-auth-has-paths "$APP"; then
+    fn-login-auth-sync-app "$APP" >/dev/null 2>&1 || true
+  else
+    fn-login-auth-remove-app-config "$APP" >/dev/null 2>&1 || true
+    fn-login-auth-render-global >/dev/null 2>&1 || true
+  fi
+}
+
+fn-login-auth-commit() {
+  declare desc="sync, validate and reload for an app, rolling back on failure"
+  declare APP="$1" PREV_STATE="$2"
+
+  if ! fn-login-auth-sync-app "$APP"; then
+    fn-login-auth-restore "$APP" "$PREV_STATE"
+    dokku_log_fail "$LOGIN_AUTH_NO_UPSTREAM_MSG"
+  fi
+  if ! fn-login-auth-validate-app "$APP"; then
+    fn-login-auth-restore "$APP" "$PREV_STATE"
+    dokku_log_fail "nginx configuration for $APP is invalid; previous login-auth config restored"
+  fi
+  fn-login-auth-reload
+}
+
+# ---------------------------------------------------------------------------
+# API keys
+# ---------------------------------------------------------------------------
+
+fn-login-auth-escape-map-value() {
+  declare desc="escape a raw token for inclusion in an nginx map string"
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+fn-login-auth-ensure-apikey-map() {
+  declare desc="ensure an app's API-key map file exists with safe permissions"
+  declare APP="$1"
+  local dir file group
+  dir="$(fn-login-auth-apikey-dir "$APP")"
+  file="$(fn-login-auth-apikey-map-path "$APP")"
+  mkdir -p "$dir"
+  [[ -f "$file" ]] || : >"$file"
+  chmod 0640 "$file" 2>/dev/null || true
+  group=""
+  if id -g www-data >/dev/null 2>&1; then
+    group="www-data"
+  elif id -g nginx >/dev/null 2>&1; then
+    group="nginx"
+  fi
+  if [[ -n "$group" ]]; then
+    chown "root:$group" "$file" 2>/dev/null || true
+  fi
+}
+
+fn-login-auth-add-key() {
+  declare desc="add or replace an API key, matched by key name"
+  declare APP="$1" KEY_NAME="$2" KEY_VALUE="$3"
+  local file tmp escaped
+  fn-login-auth-ensure-apikey-map "$APP"
+  file="$(fn-login-auth-apikey-map-path "$APP")"
+  escaped="$(fn-login-auth-escape-map-value "$KEY_VALUE")"
+  tmp="$(mktemp "$(dirname "$file")/.apikeys.XXXXXX")"
+
+  awk -v name="$KEY_NAME" '
+    $0 == "# " name { skip = 1; next }
+    skip == 1 && $0 ~ /^"/ { skip = 0; next }
+    { print }
+  ' "$file" >"$tmp" || true
+
+  {
+    printf '# %s\n' "$KEY_NAME"
+    printf '"%s" 1;\n' "$escaped"
+  } >>"$tmp"
+  mv "$tmp" "$file"
+  fn-login-auth-ensure-apikey-map "$APP"
+}
+
+fn-login-auth-remove-key() {
+  declare desc="remove an API key by key name; return 1 when not found"
+  declare APP="$1" KEY_NAME="$2"
+  local file tmp found
+  file="$(fn-login-auth-apikey-map-path "$APP")"
+  [[ -f "$file" ]] || return 1
+  tmp="$(mktemp "$(dirname "$file")/.apikeys.XXXXXX")"
+  if ! awk -v name="$KEY_NAME" '
+    $0 == "# " name { found = 1; skip = 1; next }
+    skip == 1 && $0 ~ /^"/ { skip = 0; next }
+    { print }
+    END { exit (found == 1 ? 0 : 2) }
+  ' "$file" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$file"
+  fn-login-auth-ensure-apikey-map "$APP"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Users (Authelia file backend)
+# ---------------------------------------------------------------------------
+
+fn-login-auth-users-file() {
+  declare desc="path to the authelia users.yml file"
+
+  printf '%s/users.yml' "$(fn-login-auth-config-root)"
+}
+
+fn-login-auth-require-yq() {
+  declare desc="fail clearly when mikefarah's yq (v4+) is not available"
+  if ! command -v yq >/dev/null 2>&1; then
+    dokku_log_fail "yq (mikefarah) is required but not installed; re-run 'dokku plugin:install'"
+  fi
+  if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
+    dokku_log_fail "yq is not mikefarah's Go yq (v4+); refusing to edit users.yml"
+  fi
+}
+
+fn-login-auth-yq() {
+  declare desc="run mikefarah's yq, failing clearly when absent"
+  fn-login-auth-require-yq
+  yq "$@"
+}
+
+fn-login-auth-ensure-users-file() {
+  declare desc="ensure users.yml exists with a top-level users map"
+  local file
+  file="$(fn-login-auth-users-file)"
+  mkdir -p "$(dirname "$file")"
+  if [[ ! -f "$file" ]]; then
+    printf 'users: {}\n' >"$file"
+  fi
+}
+
+fn-login-auth-user-exists() {
+  declare desc="check whether a username exists in users.yml"
+  declare USERNAME="$1"
+  local file
+  file="$(fn-login-auth-users-file)"
+  [[ -f "$file" ]] || return 1
+  env USER_NAME="$USERNAME" yq eval -e '.users | has(strenv(USER_NAME))' "$file" >/dev/null 2>&1
+}
+
+fn-login-auth-user-create() {
+  declare desc="create a user entry (username, hash, displayname, email, groups...)"
+  declare USERNAME="$1" HASH="$2" DISPLAYNAME="$3" EMAIL="$4"
+  shift 4 || true
+  local file
+  file="$(fn-login-auth-users-file)"
+  fn-login-auth-ensure-users-file
+
+  env USER_NAME="$USERNAME" yq eval -i '.users[strenv(USER_NAME)] = {}' "$file"
+  env USER_NAME="$USERNAME" yq eval -i '.users[strenv(USER_NAME)].disabled = false' "$file"
+  env USER_NAME="$USERNAME" VALUE="$HASH" yq eval -i '.users[strenv(USER_NAME)].password = strenv(VALUE)' "$file"
+  env USER_NAME="$USERNAME" VALUE="$DISPLAYNAME" yq eval -i '.users[strenv(USER_NAME)].displayname = strenv(VALUE)' "$file"
+  env USER_NAME="$USERNAME" VALUE="$EMAIL" yq eval -i '.users[strenv(USER_NAME)].email = strenv(VALUE)' "$file"
+  env USER_NAME="$USERNAME" yq eval -i '.users[strenv(USER_NAME)].groups = []' "$file"
+
+  local group
+  for group in "$@"; do
+    [[ -n "$group" ]] || continue
+    env USER_NAME="$USERNAME" GROUP="$group" yq eval -i '.users[strenv(USER_NAME)].groups += [strenv(GROUP)]' "$file"
+  done
+}
+
+fn-login-auth-user-delete() {
+  declare desc="delete a user entry"
+  declare USERNAME="$1"
+  local file
+  file="$(fn-login-auth-users-file)"
+  env USER_NAME="$USERNAME" yq eval -i 'del(.users[strenv(USER_NAME)])' "$file"
+}
+
+fn-login-auth-user-set-field() {
+  declare desc="set a scalar field on a user entry (field name is plugin-controlled)"
+  declare USERNAME="$1" FIELD="$2" VALUE="$3"
+  local file
+  file="$(fn-login-auth-users-file)"
+  env USER_NAME="$USERNAME" VALUE="$VALUE" yq eval -i ".users[strenv(USER_NAME)].${FIELD} = strenv(VALUE)" "$file"
+}
+
+fn-login-auth-hash-password() {
+  declare desc="generate an argon2id digest via the auth-portal container"
+  declare PASSWORD="$1"
+  local output hash
+  output="$(dokku enter "$LOGIN_AUTH_AUTH_PORTAL_APP" web authelia crypto hash generate argon2 --password "$PASSWORD" 2>/dev/null || true)"
+  hash="$(printf '%s\n' "$output" | awk -F': ' '/Digest:/ {print $2}' | head -n1)"
+  if [[ -z "$hash" ]]; then
+    # Older/newer CLI variants may print just the digest on its own line.
+    hash="$(printf '%s\n' "$output" | grep -oE '\$argon2id\$[^[:space:]]+' | head -n1 || true)"
+  fi
+  [[ -n "$hash" ]] || return 1
+  printf '%s' "$hash"
+}
+
+fn-login-auth-yq-sha256() {
+  declare desc="expected sha256 for the pinned yq release on this architecture"
+  declare ARCH="$1"
+  case "$ARCH" in
+    amd64) printf '%s' "8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f" ;;
+    arm64) printf '%s' "189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b" ;;
+    *) return 1 ;;
+  esac
+}
+
+fn-login-auth-has-headers-more() {
+  declare desc="detect the nginx headers-more module"
+  local dir
+
+  if command -v nginx >/dev/null 2>&1 && nginx -V 2>&1 | grep -qi 'headers_more'; then
+    return 0
+  fi
+  if command -v openresty >/dev/null 2>&1 && openresty -V 2>&1 | grep -qi 'headers_more'; then
+    return 0
+  fi
+  for dir in /usr/lib/nginx/modules /usr/lib64/nginx/modules /usr/local/openresty/nginx/modules; do
+    if ls "$dir"/ngx_http_headers_more_filter_module.so >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+fn-login-auth-restart-auth-portal() {
+  declare desc="restart auth-portal so user changes are reloaded"
+
+  dokku ps:restart "$LOGIN_AUTH_AUTH_PORTAL_APP"
+}
+
+# ---------------------------------------------------------------------------
+# auth-portal deployment
+# ---------------------------------------------------------------------------
+
+fn-login-auth-auth-portal-deployed() {
+  declare desc="check whether the auth-portal web container already exists"
+
+  docker inspect "$LOGIN_AUTH_AUTH_PORTAL_APP.web.1" >/dev/null 2>&1
+}

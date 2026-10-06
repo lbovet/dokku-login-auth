@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+cmd-login-auth-help() {
+  declare desc="help command"
+  declare CMD="$1"
+  local plugin_name="login-auth"
+  local plugin_description="Manage form login + SSO and API-key authentication for apps"
+
+  if [[ "$CMD" == "${plugin_name}:help" ]]; then
+    echo -e "Usage: dokku ${plugin_name}[:COMMAND]"
+    echo ''
+    echo "$plugin_description"
+    echo ''
+    echo 'Additional commands:'
+    fn-login-auth-help-content | sort | column -c2 -t -s,
+  elif [[ $(ps -o command= "$PPID" 2>/dev/null || true) == *"--all"* ]]; then
+    fn-login-auth-help-content
+  else
+    cat <<help_desc
+    $plugin_name, $plugin_description
+help_desc
+  fi
+}
+
+fn-login-auth-help-content() {
+  declare desc="return help content"
+  cat <<help_content
+    login-auth:init [--parent-domain <domain>] [--auth-subdomain <sub>] [--force], One-time setup of the auth-portal app
+    login-auth:enable-form <app> [--path </prefix>] [--force], Protect an app/path with form login + SSO
+    login-auth:disable-form <app> [--path </prefix>], Remove form protection for an app/path
+    login-auth:enable-apikey <app> --path </prefix> [--force], Protect an app path with API keys
+    login-auth:disable-apikey <app> --path </prefix>, Remove API-key protection for an app path
+    login-auth:bypass <app> --path </prefix> [--force], Mark an app path explicitly public
+    login-auth:add-key <app> <key-name> [<key-value>] [--from-stdin], Add an API key to an app
+    login-auth:remove-key <app> <key-name>, Remove an API key from an app
+    login-auth:user-add <username> <password> [--group <group>]... [--displayname <name>] [--email <email>], Add a user
+    login-auth:user-remove <username>, Remove a user
+    login-auth:user-passwd <username> <new-password>, Change a user's password
+    login-auth:user-list, List users
+    login-auth:report [<app>] [--format stdout|json], Show login-auth configuration
+help_content
+}

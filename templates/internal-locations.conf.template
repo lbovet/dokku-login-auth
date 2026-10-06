@@ -1,0 +1,44 @@
+# Managed by dokku-login-auth. Do not edit manually.
+
+# The single auth_request target. It is FIXED (auth_request does not
+# interpolate variables), and branches on the routing map:
+#   - mode != form  -> return 200 immediately (none/apikey need no Authelia call)
+#   - mode == form  -> proxy to Authelia's authz endpoint
+location = /internal/login-auth/authz {
+    internal;
+
+    if ($login_auth_mode__<APP_SANITIZED> != "form") {
+        return 200;
+    }
+
+    proxy_pass http://<AUTH_PORTAL_UPSTREAM>/api/authz/auth-request;
+
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-Method $request_method;
+    proxy_set_header X-Original-URL $scheme://$host$request_uri;
+    proxy_set_header X-Forwarded-Method $request_method;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Uri $request_uri;
+    proxy_set_header X-Forwarded-For $remote_addr;
+
+    proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
+    proxy_http_version 1.1;
+    proxy_buffers 4 32k;
+    client_body_buffer_size 128k;
+    send_timeout 5m;
+    proxy_read_timeout 240;
+    proxy_send_timeout 240;
+    proxy_connect_timeout 240;
+}
+
+# Redirect target when a form-path auth_request sub-request returns 401.
+# It must NOT turn an apikey 401 into a redirect, hence the mode branch.
+location @login_auth_redirect__<APP_SANITIZED> {
+    internal;
+    if ($login_auth_mode__<APP_SANITIZED> = "apikey") {
+        return 401;
+    }
+    return 302 $login_auth_redirect__<APP_SANITIZED>;
+}
