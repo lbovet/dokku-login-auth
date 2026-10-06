@@ -1,5 +1,5 @@
 ---
-theme: 'light'
+theme: 'auto'
 
 server:
   address: 'tcp://:9091'

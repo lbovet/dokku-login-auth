@@ -10,6 +10,7 @@ load test_helper
   users="$(fn-login-auth-config-root)/users.yml"
   [ -f "$config" ]
   [ -f "$users" ]
+  grep -q "theme: 'auto'" "$config"
   grep -q "domain: 'example.com'" "$config"
   grep -q "authelia_url: 'https://auth.example.com'" "$config"
   grep -q '__placeholder__' "$users"
