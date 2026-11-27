@@ -33,6 +33,9 @@ What it covers:
 - cleanup when the last path is removed or an app is deleted;
 - API-key map add/remove/replace and value escaping;
 - user add/remove/passwd/list without leaking hashes;
+- built-in `admin` lifecycle: creation on `init`, idempotency, print-once
+  generated password, `--admin-password`, overwrite protection, removal
+  refusal and `user-list` marking;
 - `login-auth:init` idempotency and secret preservation;
 - `login-auth:report` text/JSON output;
 - Authelia ACL generation: form-only rules, implicit admin subject, domain

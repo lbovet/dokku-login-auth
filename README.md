@@ -82,7 +82,8 @@ bump.
 ## Subcommands
 
 ```
-login-auth:init [--parent-domain <domain>] [--auth-subdomain <sub>] [--force]
+login-auth:init [--parent-domain <domain>] [--auth-subdomain <sub>]
+                [--admin-password <password>] [--force]
 login-auth:enable-form <app> [--path </prefix>] [--force]
 login-auth:disable-form <app> [--path </prefix>]
 login-auth:enable-apikey <app> --path </prefix> [--force]
@@ -115,6 +116,13 @@ dokku login-auth:enable-form dev-center --path /
 dokku login-auth:bypass dev-center --path /api/webhook/github
 ```
 
+## Users
+
+Users live in Authelia's file backend (`users.yml`) and are managed with the
+`login-auth:user-*` subcommands. The built-in `admin` user is created by
+`login-auth:init` (see below), always has access to every form-protected app,
+and cannot be removed; `login-auth:user-list` marks it with `(built-in)`.
+
 ## Per-app access
 
 Access is configured per app, not per path. Every app with at least one
@@ -130,6 +138,12 @@ dokku login-auth:access-list dashboard-ui
   built-in `admin` user may access it. There is no implicit "all authenticated
   users" access.
 - `admin` always has access to every form-protected app and cannot be removed.
+  `login-auth:init` creates it (displayname `Administrator`, group `admin`)
+  if missing. If `--admin-password` is omitted a 32-character hex password is
+  generated and printed once; existing admin credentials are never
+  overwritten. `login-auth:user-remove admin` always fails, while
+  `login-auth:user-add admin` works only when the user does not exist.
+- `login-auth:user-list` appends `(built-in)` to the `admin` row.
 - Usernames must exist in `users.yml`; groups may be referenced before anyone
   joins them (the plugin warns).
 - The allow list is stored in the app's `state.json`; the plugin renders the
