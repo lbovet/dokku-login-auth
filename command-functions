@@ -393,6 +393,12 @@ cmd-login-auth-user-remove() {
   local username="${1:-}"
   [[ -n "$username" ]] || dokku_log_fail "Missing username"
 
+  # SPEC §4.4.1: the built-in admin is reserved and cannot be removed, with no
+  # override. Fail before any write so users.yml stays untouched.
+  if [[ "$username" == "admin" ]]; then
+    dokku_log_fail "the built-in 'admin' user cannot be removed; use 'login-auth:user-passwd admin <password>' to change its credentials"
+  fi
+
   fn-login-auth-require-yq
   fn-login-auth-ensure-users-file
   if ! fn-login-auth-user-exists "$username"; then
@@ -464,10 +470,13 @@ cmd-login-auth-user-list() {
   fn-login-auth-ensure-users-file
   local file
   file="$(fn-login-auth-users-file)"
+  # The built-in admin is marked so operators can tell it apart from ordinary
+  # users (it cannot be removed and always has access).
   yq eval -r '
     .users // {} | to_entries | .[] |
     .key + "\t" + (.value.displayname // "") + "\t" + (.value.email // "") +
-    "\t" + ((.value.groups // []) | join(","))
+    "\t" + ((.value.groups // []) | join(",")) +
+    (if .key == "admin" then "\t(built-in)" else "" end)
   ' "$file"
 }
 
@@ -558,9 +567,18 @@ cmd-login-auth-init() {
   declare cmd="login-auth:init"
   [[ "$1" == "$cmd" ]] && shift 1
 
-  local parent_domain="" auth_subdomain="auth" force="false"
+  local parent_domain="" auth_subdomain="auth" force="false" admin_password=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --admin-password)
+        [[ $# -ge 2 ]] || dokku_log_fail "--admin-password requires a value"
+        admin_password="$2"
+        shift 2
+        ;;
+      --admin-password=*)
+        admin_password="${1#*=}"
+        shift
+        ;;
       --parent-domain)
         parent_domain="${2:-}"
         shift 2
@@ -666,11 +684,43 @@ cmd-login-auth-init() {
     dokku git:from-image "$LOGIN_AUTH_AUTH_PORTAL_APP" "$LOGIN_AUTH_AUTHELIA_IMAGE"
   fi
 
+  # SPEC §4.4.1: ensure the built-in admin user exists. Never overwrite existing
+  # admin credentials, even with --admin-password or --force; use
+  # `login-auth:user-passwd admin` for that.
+  fn-login-auth-require-yq
+  fn-login-auth-ensure-users-file
+  local admin_password_generated="false" admin_hash
+  if fn-login-auth-user-exists "admin"; then
+    dokku_log_info1 "Keeping existing 'admin' credentials"
+    if [[ -n "$admin_password" ]]; then
+      dokku_log_warn "--admin-password ignored: user 'admin' already exists (use 'login-auth:user-passwd admin' to change it)"
+    fi
+  else
+    if [[ -z "$admin_password" ]]; then
+      admin_password="$(openssl rand -hex 16)"
+      admin_password_generated="true"
+    fi
+    admin_hash="$(fn-login-auth-hash-password "$admin_password")" || \
+      dokku_log_fail "failed to generate a password hash for the admin user (is auth-portal running?)"
+    fn-login-auth-user-create "admin" "$admin_hash" "Administrator" "" "admin"
+    fn-login-auth-restart-auth-portal
+    if [[ "$admin_password_generated" == "true" ]]; then
+      dokku_log_info1 "Created built-in 'admin' user; generated password (shown once): $admin_password"
+    else
+      dokku_log_info1 "Created built-in 'admin' user with the supplied password"
+    fi
+  fi
+
   dokku_log_info1 "auth-portal configured"
   dokku_log_verbose "App:           $LOGIN_AUTH_AUTH_PORTAL_APP"
   dokku_log_verbose "Domain:        $auth_domain"
   dokku_log_verbose "Storage:       $config_root"
-  dokku_log_verbose "Reminder:      run 'dokku login-auth:user-add <user> <password>' to create the first user"
+  dokku_log_verbose "Admin user:    admin (built-in, cannot be removed)"
+  if [[ "$admin_password_generated" == "true" ]]; then
+    dokku_log_verbose "Admin password: generated above; it is not stored in plaintext and is shown only once"
+  fi
+  dokku_log_verbose "Reminder:      run 'dokku login-auth:user-add <user> <password>' to create other users"
+  dokku_log_verbose "Reminder:      run 'dokku login-auth:access-set <app> --user <user>' to grant per-app access"
 }
 
 # ---------------------------------------------------------------------------

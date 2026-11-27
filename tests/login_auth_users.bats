@@ -58,3 +58,38 @@ load test_helper
   groups="$(yq eval -r '.users.bob.groups | join(",")' "$(fn-login-auth-users-file)")"
   [ "$groups" == "admins,ops" ]
 }
+
+@test "user-list marks the built-in admin user" {
+  cmd-login-auth-init --parent-domain example.com
+  run cmd-login-auth-user-list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'admin\tAdministrator\t\tadmin\t(built-in)'* ]]
+}
+
+@test "user-remove admin fails and leaves users.yml unchanged" {
+  cmd-login-auth-init --parent-domain example.com
+  local users before
+  users="$(fn-login-auth-users-file)"
+  before="$(cat "$users")"
+
+  run cmd-login-auth-user-remove admin
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot be removed"* ]]
+  [ "$(cat "$users")" == "$before" ]
+}
+
+@test "user-add admin is a duplicate error once the built-in exists" {
+  cmd-login-auth-init --parent-domain example.com
+  run cmd-login-auth-user-add admin other
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already exists"* ]]
+}
+
+@test "user-add admin is allowed when the admin user does not exist" {
+  cmd-login-auth-init --parent-domain example.com
+  fn-login-auth-user-delete admin
+
+  run cmd-login-auth-user-add admin secret --displayname Administrator --group admin
+  [ "$status" -eq 0 ]
+  fn-login-auth-user-exists admin
+}
