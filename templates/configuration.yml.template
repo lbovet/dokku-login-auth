@@ -32,7 +32,7 @@ access_control:
   default_policy: 'deny'
   rules:
     # Portal self-access (login UI / static assets) must be pre-auth.
-    - domain: 'auth.<PARENT_DOMAIN>'
+    - domain: '<AUTH_DOMAIN>'
       policy: 'bypass'
       resources:
         - '^/api/authz/auth-request([/?].*)?$'
@@ -47,8 +47,8 @@ session:
   secret: '<SESSION_SECRET>'
   cookies:
     - domain: '<PARENT_DOMAIN>'
-      authelia_url: 'https://auth.<PARENT_DOMAIN>'
-      default_redirection_url: 'https://auth.<PARENT_DOMAIN>'
+      authelia_url: 'https://<AUTH_DOMAIN>'
+      default_redirection_url: 'https://<AUTH_DOMAIN>'
       expiration: '1h'
       inactivity: '15m'
 
