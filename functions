@@ -273,6 +273,29 @@ fn-login-auth-access-set() {
   fn-login-auth-state-write "$APP" "$json"
 }
 
+fn-login-auth-access-remove-user() {
+  declare desc="remove a username from an app's access allow list"
+  declare APP="$1" USERNAME="$2"
+  local json
+  json="$(fn-login-auth-state-read "$APP" | jq --arg app "$APP" --arg u "$USERNAME" '
+    .app = $app
+    | .access.users = ((.access.users // []) | map(select(. != $u)))
+  ')"
+  fn-login-auth-state-write "$APP" "$json"
+}
+
+fn-login-auth-apps-listing-user() {
+  declare desc="list apps whose access allow list contains a username"
+  declare USERNAME="$1"
+  local app
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    if fn-login-auth-access-read "$app" | jq -e --arg u "$USERNAME" '(.users // []) | index($u)' >/dev/null 2>&1; then
+      printf '%s\n' "$app"
+    fi
+  done < <(fn-login-auth-list-configured-apps)
+}
+
 fn-login-auth-set-path() {
   declare desc="insert or overwrite a path/mode entry in the app state"
   declare APP="$1" PATH_PREFIX="$2" MODE="$3"
@@ -306,6 +329,99 @@ fn-login-auth-list-configured-apps() {
     [[ "$app" == "_global" ]] && continue
     fn-login-auth-has-paths "$app" && printf '%s\n' "$app"
   done | sort
+}
+
+fn-login-auth-list-form-apps() {
+  declare desc="list apps with at least one form-protected path"
+  local app
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    fn-login-auth-has-mode "$app" form && printf '%s\n' "$app"
+  done < <(fn-login-auth-list-configured-apps)
+}
+
+# ---------------------------------------------------------------------------
+# Authelia ACL rules (SPEC §4.4.2 / §4.4.3)
+# ---------------------------------------------------------------------------
+
+fn-login-auth-resolve-app-domains() {
+  declare desc="emit an app's effective Dokku domains, falling back to global vhosts"
+  declare APP="$1"
+  local raw domain
+
+  raw="$(dokku domains:report "$APP" --domains-app-vhosts 2>/dev/null || true)"
+  if [[ -z "${raw//[[:space:],]/}" ]]; then
+    raw="$(dokku domains:report --global --domains-global-vhosts 2>/dev/null || true)"
+  fi
+  while IFS= read -r domain; do
+    [[ -n "$domain" ]] && printf '%s\n' "$domain"
+  done < <(printf '%s\n' "$raw" | tr ' ,\t' '\n')
+}
+
+fn-login-auth-app-domains-json() {
+  declare desc="emit an app's resolved domains as a JSON array"
+  declare APP="$1"
+  local -a domains=()
+  local domain
+
+  while IFS= read -r domain; do
+    [[ -n "$domain" ]] && domains+=("$domain")
+  done < <(fn-login-auth-resolve-app-domains "$APP")
+
+  if [[ ${#domains[@]} -eq 0 ]]; then
+    dokku_log_error "cannot resolve any Dokku domain for form-protected app '$APP'; set an app or global domain first"
+    return 1
+  fi
+  printf '%s\n' "${domains[@]}" | sort -u | jq -R . | jq -s -c .
+}
+
+fn-login-auth-acl-subject-json() {
+  declare desc="emit an app's ACL subject (allow list plus implicit admin)"
+  declare APP="$1"
+
+  fn-login-auth-access-read "$APP" | jq -c '
+    ["user:admin"]
+    + ((.users // []) | map(select(. != "admin")) | map("user:" + .))
+    + ((.groups // []) | map("group:" + .))
+  '
+}
+
+fn-login-auth-acl-rules-json() {
+  declare desc="emit the full access_control.rules array (portal bypass first)"
+  declare PARENT_DOMAIN="$1"
+  local app domains_json subject rule
+  local -a rules=()
+
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    domains_json="$(fn-login-auth-app-domains-json "$app")" || return 1
+    subject="$(fn-login-auth-acl-subject-json "$app")" || return 1
+    rule="$(jq -nc --argjson d "$domains_json" --argjson s "$subject" \
+      '{domain: $d, policy: "one_factor", subject: $s}')"
+    rules+=("$rule")
+  done < <(fn-login-auth-list-form-apps)
+
+  local apps_json='[]'
+  if [[ ${#rules[@]} -gt 0 ]]; then
+    apps_json="$(printf '%s\n' "${rules[@]}" | jq -s -c '
+      sort_by([
+        (if any(.domain[]; (contains("*") | not)) then 0 else 1 end),
+        -([.domain[] | split(".") | length] | max),
+        (.domain | sort | join(","))
+      ])
+    ')" || return 1
+  fi
+
+  jq -nc --arg parent "$PARENT_DOMAIN" --argjson apps "$apps_json" '
+    [{
+      domain: ("auth." + $parent),
+      policy: "bypass",
+      resources: [
+        "^/api/authz/auth-request([/?].*)?$",
+        "^/(static|locales)/.*$"
+      ]
+    }] + $apps
+  '
 }
 
 # ---------------------------------------------------------------------------
@@ -465,6 +581,85 @@ fn-login-auth-render-global() {
   rm -f "$tmp"
 }
 
+fn-login-auth-sync-acl() {
+  declare desc="regenerate Authelia per-app ACL rules in configuration.yml"
+  declare RESTART="${1:-true}"
+  LOGIN_AUTH_ACL_CHANGED="false"
+
+  local config_file parent new_rules old_rules backup tmp
+  config_file="$(fn-login-auth-config-root)/configuration.yml"
+  [[ -f "$config_file" ]] || return 0
+
+  fn-login-auth-require-yq
+  parent="$(fn-login-auth-parent-domain)"
+  if [[ -z "$parent" ]]; then
+    dokku_log_error "login-auth global state has no parent domain; run login-auth:init first"
+    return 1
+  fi
+
+  if ! new_rules="$(fn-login-auth-acl-rules-json "$parent")"; then
+    return 1
+  fi
+  old_rules="$(fn-login-auth-yq eval -o=json -I=0 '.access_control.rules // []' "$config_file")" || return 1
+  if [[ "$(printf '%s' "$old_rules" | jq -S -c .)" == "$(printf '%s' "$new_rules" | jq -S -c .)" ]]; then
+    return 0
+  fi
+
+  backup="$(mktemp)"
+  tmp="$(mktemp)"
+  if ! cp -p "$config_file" "$backup" || ! cp -p "$config_file" "$tmp"; then
+    rm -f "$backup" "$tmp"
+    dokku_log_error "failed to prepare $config_file for ACL regeneration"
+    return 1
+  fi
+
+  if ! RULES_JSON="$new_rules" AUTH_DOMAIN="auth.$parent" fn-login-auth-yq eval -i '
+      .access_control.default_policy = "deny"
+      | .access_control.rules = (strenv(RULES_JSON) | from_json)
+      | .session.cookies[0].default_redirection_url = ("https://" + strenv(AUTH_DOMAIN))
+    ' "$tmp"; then
+    rm -f "$backup" "$tmp"
+    dokku_log_error "failed to render Authelia ACL rules into $config_file"
+    return 1
+  fi
+
+  if ! fn-login-auth-yq eval '.' "$tmp" >/dev/null 2>&1; then
+    rm -f "$backup" "$tmp"
+    dokku_log_error "generated Authelia configuration is not valid YAML; previous configuration kept"
+    return 1
+  fi
+
+  # Copy into the existing file (instead of renaming the temp file over it) so
+  # the Authelia container's 0600/UID-1000 ownership of configuration.yml is
+  # preserved across regeneration.
+  if ! cat "$tmp" >"$config_file"; then
+    cat "$backup" >"$config_file" 2>/dev/null || true
+    rm -f "$backup" "$tmp"
+    dokku_log_error "failed to write $config_file; previous configuration restored"
+    return 1
+  fi
+
+  if ! fn-login-auth-validate-authelia-config; then
+    cat "$backup" >"$config_file" 2>/dev/null || true
+    rm -f "$backup" "$tmp"
+    dokku_log_error "Authelia rejected the generated configuration; previous configuration restored"
+    return 1
+  fi
+
+  LOGIN_AUTH_ACL_CHANGED="true"
+  if [[ "$RESTART" == "true" ]] && fn-login-auth-auth-portal-deployed; then
+    if ! fn-login-auth-restart-auth-portal; then
+      cat "$backup" >"$config_file" 2>/dev/null || true
+      rm -f "$backup" "$tmp"
+      dokku_log_error "failed to restart $LOGIN_AUTH_AUTH_PORTAL_APP; previous configuration restored"
+      return 1
+    fi
+  fi
+
+  rm -f "$backup" "$tmp"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Sync / validate / reload
 # ---------------------------------------------------------------------------
@@ -539,6 +734,10 @@ fn-login-auth-commit() {
     dokku_log_fail "nginx configuration for $APP is invalid; previous login-auth config restored"
   fi
   fn-login-auth-reload
+  if ! fn-login-auth-sync-acl; then
+    fn-login-auth-restore "$APP" "$PREV_STATE"
+    dokku_log_fail "failed to regenerate Authelia ACL rules; previous login-auth config restored"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -752,6 +951,24 @@ fn-login-auth-restart-auth-portal() {
   declare desc="restart auth-portal so user changes are reloaded"
 
   dokku ps:restart "$LOGIN_AUTH_AUTH_PORTAL_APP"
+}
+
+fn-login-auth-validate-authelia-config() {
+  declare desc="validate configuration.yml inside the running auth-portal when possible"
+  local output
+
+  fn-login-auth-auth-portal-deployed || return 0
+  if output="$(dokku enter "$LOGIN_AUTH_AUTH_PORTAL_APP" web authelia validate-config --config /config/configuration.yml 2>&1)"; then
+    return 0
+  fi
+  # Older Authelia images have no validate-config subcommand, and a stopped
+  # portal cannot run it; treat those as "not available" rather than as an
+  # invalid configuration.
+  if printf '%s' "$output" | grep -qiE 'unknown command|unrecognized command|command not found|unknown flag|not running|no such container|cannot exec'; then
+    return 0
+  fi
+  printf '%s\n' "$output" >&2
+  return 1
 }
 
 # ---------------------------------------------------------------------------
