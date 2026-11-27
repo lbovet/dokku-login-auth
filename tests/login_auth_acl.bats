@@ -191,3 +191,57 @@ login_auth_rules() {
   login_auth_rules | jq -e '.[1].subject == ["user:admin"]'
   [ "$(fn-login-auth-access-read app1 | jq -r '.users | length')" -eq 0 ]
 }
+
+@test "init --auth-subdomain uses the subdomain for the portal bypass and redirect URL" {
+  cmd-login-auth-init --parent-domain example.com --auth-subdomain sso
+  cmd-login-auth-enable-form app1
+
+  local rules
+  rules="$(login_auth_rules)"
+  [ "$(printf '%s' "$rules" | jq -r '.[0].domain')" == "sso.example.com" ]
+  printf '%s' "$rules" | jq -e '.[0].policy == "bypass"'
+  printf '%s' "$rules" | jq -e '.[1].domain == ["app1.example.com"]'
+  [ "$(yq eval -r '.session.cookies[0].default_redirection_url' "$(login_auth_config_file)")" == "https://sso.example.com" ]
+  [ "$(yq eval -r '.session.cookies[0].authelia_url' "$(login_auth_config_file)")" == "https://sso.example.com" ]
+}
+
+@test "ACL regeneration preserves the configured auth subdomain" {
+  cmd-login-auth-init --parent-domain example.com --auth-subdomain sso
+  cmd-login-auth-enable-form app1
+  cmd-login-auth-user-add alice secret
+  cmd-login-auth-access-set app1 --user alice
+
+  local rules
+  rules="$(login_auth_rules)"
+  [ "$(printf '%s' "$rules" | jq -r '.[0].domain')" == "sso.example.com" ]
+  [ "$(printf '%s' "$rules" | jq -r '.[1].subject | join(",")')" == "user:admin,user:alice" ]
+  [ "$(yq eval -r '.session.cookies[0].default_redirection_url' "$(login_auth_config_file)")" == "https://sso.example.com" ]
+  [ "$(yq eval -r '.session.cookies[0].authelia_url' "$(login_auth_config_file)")" == "https://sso.example.com" ]
+}
+
+@test "re-running init repairs a config with the hardcoded default subdomain" {
+  cmd-login-auth-init --parent-domain example.com --auth-subdomain sso
+
+  # Simulate a configuration written by the old hardcoded generator.
+  local config
+  config="$(login_auth_config_file)"
+  AUTH_DOMAIN="auth.example.com" yq eval -i '
+    .access_control.rules[0].domain = strenv(AUTH_DOMAIN)
+    | .session.cookies[0].authelia_url = ("https://" + strenv(AUTH_DOMAIN))
+    | .session.cookies[0].default_redirection_url = ("https://" + strenv(AUTH_DOMAIN))
+  ' "$config"
+  [ "$(yq eval -r '.session.cookies[0].authelia_url' "$config")" == "https://auth.example.com" ]
+
+  run cmd-login-auth-init --parent-domain example.com
+  [ "$status" -eq 0 ]
+  [ "$(yq eval -r '.access_control.rules[0].domain' "$config")" == "sso.example.com" ]
+  [ "$(yq eval -r '.session.cookies[0].authelia_url' "$config")" == "https://sso.example.com" ]
+  [ "$(yq eval -r '.session.cookies[0].default_redirection_url' "$config")" == "https://sso.example.com" ]
+}
+
+@test "the ACL generator has no hardcoded auth.<parent> portal domain" {
+  run grep -nF '"auth." + $parent' "$REPO_ROOT/functions"
+  [ "$status" -ne 0 ]
+  run grep -nF 'auth.<PARENT_DOMAIN>' "$REPO_ROOT/templates/configuration.yml.template"
+  [ "$status" -ne 0 ]
+}

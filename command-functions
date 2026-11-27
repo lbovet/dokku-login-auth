@@ -648,6 +648,7 @@ cmd-login-auth-init() {
     storage_secret="$(openssl rand -hex 32)"
     fn-login-auth-render-template "$LOGIN_AUTH_PLUGIN_DIR/templates/configuration.yml.template" \
       "PARENT_DOMAIN=$parent_domain" \
+      "AUTH_DOMAIN=$auth_domain" \
       "JWT_SECRET=$jwt_secret" \
       "SESSION_SECRET=$session_secret" \
       "STORAGE_SECRET=$storage_secret" >"$config_file"

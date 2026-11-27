@@ -389,8 +389,13 @@ fn-login-auth-acl-subject-json() {
 fn-login-auth-acl-rules-json() {
   declare desc="emit the full access_control.rules array (portal bypass first)"
   declare PARENT_DOMAIN="$1"
-  local app domains_json subject rule
+  local auth_subdomain app domains_json subject rule
   local -a rules=()
+
+  # The portal bypass must target the configured auth subdomain, not a
+  # hardcoded 'auth', otherwise 'init --auth-subdomain sso' serves the portal
+  # at sso.<parent> while its own pre-auth paths are denied.
+  auth_subdomain="$(fn-login-auth-auth-subdomain)"
 
   while IFS= read -r app; do
     [[ -n "$app" ]] || continue
@@ -412,9 +417,9 @@ fn-login-auth-acl-rules-json() {
     ')" || return 1
   fi
 
-  jq -nc --arg parent "$PARENT_DOMAIN" --argjson apps "$apps_json" '
+  jq -nc --arg parent "$PARENT_DOMAIN" --arg sub "$auth_subdomain" --argjson apps "$apps_json" '
     [{
-      domain: ("auth." + $parent),
+      domain: ($sub + "." + $parent),
       policy: "bypass",
       resources: [
         "^/api/authz/auth-request([/?].*)?$",
@@ -586,7 +591,8 @@ fn-login-auth-sync-acl() {
   declare RESTART="${1:-true}"
   LOGIN_AUTH_ACL_CHANGED="false"
 
-  local config_file parent new_rules old_rules backup tmp
+  local config_file parent auth_subdomain auth_domain desired_url
+  local new_rules old_rules old_redirection_url old_authelia_url backup tmp
   config_file="$(fn-login-auth-config-root)/configuration.yml"
   [[ -f "$config_file" ]] || return 0
 
@@ -596,12 +602,19 @@ fn-login-auth-sync-acl() {
     dokku_log_error "login-auth global state has no parent domain; run login-auth:init first"
     return 1
   fi
+  auth_subdomain="$(fn-login-auth-auth-subdomain)"
+  auth_domain="$auth_subdomain.$parent"
+  desired_url="https://$auth_domain"
 
   if ! new_rules="$(fn-login-auth-acl-rules-json "$parent")"; then
     return 1
   fi
   old_rules="$(fn-login-auth-yq eval -o=json -I=0 '.access_control.rules // []' "$config_file")" || return 1
-  if [[ "$(printf '%s' "$old_rules" | jq -S -c .)" == "$(printf '%s' "$new_rules" | jq -S -c .)" ]]; then
+  old_redirection_url="$(fn-login-auth-yq eval -r '.session.cookies[0].default_redirection_url // ""' "$config_file")" || return 1
+  old_authelia_url="$(fn-login-auth-yq eval -r '.session.cookies[0].authelia_url // ""' "$config_file")" || return 1
+  if [[ "$(printf '%s' "$old_rules" | jq -S -c .)" == "$(printf '%s' "$new_rules" | jq -S -c .)" ]] &&
+    [[ "$old_redirection_url" == "$desired_url" ]] &&
+    [[ "$old_authelia_url" == "$desired_url" ]]; then
     return 0
   fi
 
@@ -613,9 +626,10 @@ fn-login-auth-sync-acl() {
     return 1
   fi
 
-  if ! RULES_JSON="$new_rules" AUTH_DOMAIN="auth.$parent" fn-login-auth-yq eval -i '
+  if ! RULES_JSON="$new_rules" AUTH_DOMAIN="$auth_domain" fn-login-auth-yq eval -i '
       .access_control.default_policy = "deny"
       | .access_control.rules = (strenv(RULES_JSON) | from_json)
+      | .session.cookies[0].authelia_url = ("https://" + strenv(AUTH_DOMAIN))
       | .session.cookies[0].default_redirection_url = ("https://" + strenv(AUTH_DOMAIN))
     ' "$tmp"; then
     rm -f "$backup" "$tmp"
