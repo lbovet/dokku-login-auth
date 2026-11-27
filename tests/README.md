@@ -35,6 +35,9 @@ What it covers:
 - user add/remove/passwd/list without leaking hashes;
 - `login-auth:init` idempotency and secret preservation;
 - `login-auth:report` text/JSON output;
+- Authelia ACL generation: form-only rules, implicit admin subject, domain
+  resolution/global fallback, specificity ordering, no catch-all, secret and
+  file-mode preservation, and rollback on validation failure;
 - dependency detection (`headers-more`, `yq` checksums).
 
 ## HTTP smoke test (manual, on a real Dokku host)

@@ -13,6 +13,7 @@ load test_helper
   grep -q "theme: 'auto'" "$config"
   grep -q "domain: 'example.com'" "$config"
   grep -q "authelia_url: 'https://auth.example.com'" "$config"
+  grep -q "default_redirection_url: 'https://auth.example.com'" "$config"
   grep -q '__placeholder__' "$users"
   grep -q 'disabled: true' "$users"
 }

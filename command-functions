@@ -399,8 +399,38 @@ cmd-login-auth-user-remove() {
     dokku_log_warn "user '$username' does not exist; nothing to do"
     return 0
   fi
+
+  # Removing a user must also drop it from every app allow list (SPEC §4.4.3)
+  # and regenerate the ACL rules. Keep the old state so the whole change can be
+  # rolled back if Authelia rejects the generated configuration.
+  local users_file rollback_dir app
+  local -a touched=()
+  users_file="$(fn-login-auth-users-file)"
+  rollback_dir="$(mktemp -d)"
+  cp -p "$users_file" "$rollback_dir/users.yml"
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    fn-login-auth-state-read "$app" >"$rollback_dir/$app.json"
+    fn-login-auth-access-remove-user "$app" "$username"
+    touched+=("$app")
+  done < <(fn-login-auth-apps-listing-user "$username")
+
   fn-login-auth-user-delete "$username"
-  fn-login-auth-restart-auth-portal
+  if ! fn-login-auth-sync-acl; then
+    for app in "${touched[@]}"; do
+      fn-login-auth-state-write "$app" "$(cat "$rollback_dir/$app.json")"
+    done
+    cat "$rollback_dir/users.yml" >"$users_file"
+    fn-login-auth-sync-acl >/dev/null 2>&1 || true
+    rm -rf "$rollback_dir"
+    dokku_log_fail "failed to regenerate Authelia ACL rules; previous user and access state restored"
+  fi
+  rm -rf "$rollback_dir"
+  # users.yml changed even when no app allow list referenced the user, so
+  # restart when the ACL sync did not already do it.
+  if [[ "$LOGIN_AUTH_ACL_CHANGED" != "true" ]]; then
+    fn-login-auth-restart-auth-portal
+  fi
   dokku_log_info1 "Removed user '$username'"
 }
 
@@ -475,10 +505,16 @@ cmd-login-auth-access-set() {
     groups+=("$group")
   done
 
-  local users_json groups_json
+  local users_json groups_json prev
   users_json="$(fn-login-auth-json-array "${users[@]}")"
   groups_json="$(fn-login-auth-json-array "${groups[@]}")"
+  prev="$(fn-login-auth-state-read "$app")"
   fn-login-auth-access-set "$app" "$users_json" "$groups_json"
+  if ! fn-login-auth-sync-acl; then
+    fn-login-auth-state-write "$app" "$prev"
+    fn-login-auth-sync-acl >/dev/null 2>&1 || true
+    dokku_log_fail "failed to regenerate Authelia ACL rules; previous access state restored"
+  fi
   dokku_log_info1 "Updated access for '$app'"
 }
 
@@ -610,12 +646,8 @@ cmd-login-auth-init() {
 
   dokku domains:set "$LOGIN_AUTH_AUTH_PORTAL_APP" "$auth_domain" >/dev/null
 
-  if fn-login-auth-auth-portal-deployed; then
-    dokku ps:restart "$LOGIN_AUTH_AUTH_PORTAL_APP"
-  else
-    dokku git:from-image "$LOGIN_AUTH_AUTH_PORTAL_APP" "$LOGIN_AUTH_AUTHELIA_IMAGE"
-  fi
-
+  # Record the parent domain before ACL generation: the generator needs it and
+  # init must regenerate rules from any app state that already exists.
   local gstate
   gstate="$(jq -n \
     --arg parent "$parent_domain" \
@@ -623,6 +655,16 @@ cmd-login-auth-init() {
     --arg version "$LOGIN_AUTH_AUTHELIA_IMAGE" \
     '{parent_domain: $parent, auth_subdomain: $sub, authelia_image: $version}')"
   fn-login-auth-global-state-write "$gstate"
+
+  if ! fn-login-auth-sync-acl false; then
+    dokku_log_fail "failed to generate Authelia ACL rules; fix the reported problem and re-run login-auth:init"
+  fi
+
+  if fn-login-auth-auth-portal-deployed; then
+    dokku ps:restart "$LOGIN_AUTH_AUTH_PORTAL_APP"
+  else
+    dokku git:from-image "$LOGIN_AUTH_AUTH_PORTAL_APP" "$LOGIN_AUTH_AUTHELIA_IMAGE"
+  fi
 
   dokku_log_info1 "auth-portal configured"
   dokku_log_verbose "App:           $LOGIN_AUTH_AUTH_PORTAL_APP"

@@ -135,12 +135,39 @@ dokku login-auth:access-list dashboard-ui
 - The allow list is stored in the app's `state.json`; the plugin renders the
   matching Authelia ACL rule on the next mutating command.
 
+For every app with at least one `form` path the plugin writes one
+`one_factor` rule into `configuration.yml`:
+
+- `domain` is the app's effective Dokku vhosts, resolved with
+  `dokku domains:report <app> --domains-app-vhosts`, falling back to the
+  global vhosts when the app has none. Wildcards are kept as configured.
+- `subject` is the app's allow list preceded by the implicit `user:admin`;
+  an app with no allow list gets `['user:admin']` (admin-only).
+- Rules follow the portal bypass rule in domain-specificity order, so an
+  exact `b.example.com` wins over a broader `*.example.com`.
+
+There is no catch-all `*.<parent-domain>` rule: an app without a generated
+rule is denied by `default_policy: deny`, which is the safe default. A
+form-protected app with no resolvable domain fails the mutating command and
+leaves the previous configuration untouched.
+
+The rules are regenerated on `enable-form`, `disable-form`, `access-set`,
+`user-remove`, and `init`; the generated secrets are never regenerated.
+Domain changes are not watched automatically — after
+`dokku domains:add`/`domains:remove`, re-run a mutating command (for example
+`dokku login-auth:access-set <app>` with the app's current allow-list flags)
+so the ACL rule picks up the new domains. `auth-portal` is restarted only
+when the generated rules changed.
+
 ## State
 
 - `/var/lib/dokku/services/login-auth/<app>/state.json` — per-app path/mode
   and access state.
 - `/var/lib/dokku/services/login-auth/_global/state.json` — global settings
   (parent domain, pins).
+- `/var/lib/dokku/data/storage/auth-portal/config/configuration.yml` —
+  Authelia configuration, including the generated `access_control.rules`
+  list (do not hand-edit the rules; the plugin rewrites them).
 - `/etc/nginx/login-auth/<app>/apikeys.map` — API-key value map (mode `0640`,
   owned `root:www-data`).
 

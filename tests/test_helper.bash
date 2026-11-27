@@ -56,6 +56,17 @@ _dokku_stub() {
     storage:list) return 0 ;;
     storage:mount) return 0 ;;
     domains:set) return 0 ;;
+    domains:report)
+      if [[ "${2:-}" == "--global" ]]; then
+        printf '%s\n' "${DOKKU_GLOBAL_DOMAINS-global.example.com}"
+      else
+        case "${2:-}" in
+          app1) printf '%s\n' "${APP1_DOMAINS-app1.example.com}" ;;
+          app2) printf '%s\n' "${APP2_DOMAINS-app2.example.com}" ;;
+          combo) printf '%s\n' "${COMBO_DOMAINS-combo.example.com}" ;;
+        esac
+      fi
+      ;;
     ps:restart) return 0 ;;
     git:from-image) return 0 ;;
     enter) printf 'Digest: $argon2id$v=19$m=65536,t=3,p=4$%s$%s\n' "$(date +%s%N)" "$RANDOM" ;;
