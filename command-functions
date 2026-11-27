@@ -95,6 +95,50 @@ fn-login-auth-parse-disable-args() {
   verify_app_name "$LOGIN_AUTH_ARG_APP"
 }
 
+fn-login-auth-parse-access-args() {
+  declare desc="parse <app> [--user <u>]... [--group <g>]..."
+  LOGIN_AUTH_ARG_APP=""
+  LOGIN_AUTH_ARG_USERS=()
+  LOGIN_AUTH_ARG_GROUPS=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user)
+        [[ $# -ge 2 ]] || dokku_log_fail "--user requires a value"
+        LOGIN_AUTH_ARG_USERS+=("$2")
+        shift 2
+        ;;
+      --user=*)
+        LOGIN_AUTH_ARG_USERS+=("${1#*=}")
+        shift
+        ;;
+      --group)
+        [[ $# -ge 2 ]] || dokku_log_fail "--group requires a value"
+        LOGIN_AUTH_ARG_GROUPS+=("$2")
+        shift 2
+        ;;
+      --group=*)
+        LOGIN_AUTH_ARG_GROUPS+=("${1#*=}")
+        shift
+        ;;
+      -*)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$LOGIN_AUTH_ARG_APP" ]]; then
+          LOGIN_AUTH_ARG_APP="$1"
+        else
+          dokku_log_fail "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$LOGIN_AUTH_ARG_APP" ]] || dokku_log_fail "Please specify an app"
+  verify_app_name "$LOGIN_AUTH_ARG_APP"
+}
+
 fn-login-auth-normalize-or-fail() {
   declare desc="normalize a path prefix or fail before any write"
   local raw="$1"
@@ -398,6 +442,78 @@ cmd-login-auth-user-list() {
 }
 
 # ---------------------------------------------------------------------------
+# Per-app access
+# ---------------------------------------------------------------------------
+
+cmd-login-auth-access-set() {
+  declare desc="replace an app's access allow list"
+  declare cmd="login-auth:access-set"
+  [[ "$1" == "$cmd" ]] && shift 1
+  fn-login-auth-parse-access-args "$@"
+
+  local app="$LOGIN_AUTH_ARG_APP"
+  local user group
+  local -a users=() groups=()
+
+  fn-login-auth-require-yq
+  fn-login-auth-ensure-users-file
+
+  for user in "${LOGIN_AUTH_ARG_USERS[@]}"; do
+    fn-login-auth-valid-access-name "$user" || \
+      dokku_log_fail "Invalid username '$user': use only letters, digits, '.', '_' and '-'"
+    fn-login-auth-user-exists "$user" || \
+      dokku_log_fail "User '$user' does not exist; create it with login-auth:user-add"
+    users+=("$user")
+  done
+
+  for group in "${LOGIN_AUTH_ARG_GROUPS[@]}"; do
+    fn-login-auth-valid-access-name "$group" || \
+      dokku_log_fail "Invalid group name '$group': use only letters, digits, '.', '_' and '-'"
+    if ! fn-login-auth-group-exists "$group"; then
+      dokku_log_warn "Group '$group' has no members yet"
+    fi
+    groups+=("$group")
+  done
+
+  local users_json groups_json
+  users_json="$(fn-login-auth-json-array "${users[@]}")"
+  groups_json="$(fn-login-auth-json-array "${groups[@]}")"
+  fn-login-auth-access-set "$app" "$users_json" "$groups_json"
+  dokku_log_info1 "Updated access for '$app'"
+}
+
+cmd-login-auth-access-list() {
+  declare desc="print an app's access allow list"
+  declare cmd="login-auth:access-list"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local app=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*)
+        dokku_log_fail "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$app" ]]; then
+          app="$1"
+        else
+          dokku_log_fail "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$app" ]] || dokku_log_fail "Please specify an app"
+  verify_app_name "$app"
+
+  local users groups
+  users="$(fn-login-auth-access-read "$app" | jq -r '.users | join(",")')"
+  groups="$(fn-login-auth-access-read "$app" | jq -r '.groups | join(",")')"
+  printf 'users: %s\n' "${users:-(none)}"
+  printf 'groups: %s\n' "${groups:-(none)}"
+}
+
+# ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
 
@@ -527,10 +643,12 @@ fn-login-auth-report-single-json() {
   jq -n \
     --arg app "$APP" \
     --arg upstream "$upstream" \
+    --argjson access "$(fn-login-auth-access-read "$APP")" \
     --argjson paths "$(fn-login-auth-state-read "$APP" | jq '.paths // []')" \
     '{
       app: $app,
       auth_portal_upstream: (if $upstream == "" then null else $upstream end),
+      access: $access,
       paths: ($paths | map({path: .path, mode: .mode, target: (
         if .mode == "form" then "auth_request:authelia"
         elif .mode == "apikey" then "auth_request:apikey"
@@ -541,7 +659,7 @@ fn-login-auth-report-single-json() {
 fn-login-auth-report-single-text() {
   declare desc="emit a single app's login-auth state as text"
   declare APP="$1"
-  local upstream path mode
+  local upstream path mode users groups
   upstream="$(fn-login-auth-resolve-upstream 2>/dev/null || true)"
   [[ -n "$upstream" ]] || upstream="(missing)"
 
@@ -551,6 +669,10 @@ fn-login-auth-report-single-text() {
     [[ -n "$path" ]] || continue
     dokku_log_verbose "$(printf '%-24s %s' "$mode:" "$path")"
   done < <(fn-login-auth-list-paths "$APP")
+  users="$(fn-login-auth-access-read "$APP" | jq -r '.users | join(",")')"
+  groups="$(fn-login-auth-access-read "$APP" | jq -r '.groups | join(",")')"
+  dokku_log_verbose "$(printf '%-24s %s' "Allow-list users:" "${users:-(none)}")"
+  dokku_log_verbose "$(printf '%-24s %s' "Allow-list groups:" "${groups:-(none)}")"
 }
 
 cmd-login-auth-report() {

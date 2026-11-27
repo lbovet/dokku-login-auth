@@ -33,6 +33,8 @@ fn-login-auth-help-content() {
     login-auth:enable-apikey <app> --path </prefix> [--force], Protect an app path with API keys
     login-auth:disable-apikey <app> --path </prefix>, Remove API-key protection for an app path
     login-auth:bypass <app> --path </prefix> [--force], Mark an app path explicitly public
+    login-auth:access-set <app> [--user <username>]... [--group <group>]..., Replace an app's access allow list
+    login-auth:access-list <app>, Show an app's access allow list
     login-auth:add-key <app> <key-name> [<key-value>] [--from-stdin], Add an API key to an app
     login-auth:remove-key <app> <key-name>, Remove an API key from an app
     login-auth:user-add <username> <password> [--group <group>]... [--displayname <name>] [--email <email>], Add a user

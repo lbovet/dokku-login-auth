@@ -171,9 +171,15 @@ fn-login-auth-state-read() {
   file="$(fn-login-auth-state-file "$APP")"
 
   if [[ -f "$file" ]]; then
-    jq --arg app "$APP" '.app = $app | .paths = (.paths // [])' "$file"
+    jq --arg app "$APP" '
+      .app = $app
+      | .paths = (.paths // [])
+      | .access = (.access // {})
+      | .access.users = ((.access.users // []) | unique | sort)
+      | .access.groups = ((.access.groups // []) | unique | sort)
+    ' "$file"
   else
-    jq -n --arg app "$APP" '{app: $app, paths: []}'
+    jq -n --arg app "$APP" '{app: $app, paths: [], access: {users: [], groups: []}}'
   fi
 }
 
@@ -221,6 +227,50 @@ fn-login-auth-list-paths() {
   declare APP="$1"
 
   fn-login-auth-state-read "$APP" | jq -r '.paths[]? | "\(.mode)\t\(.path)"'
+}
+
+fn-login-auth-valid-access-name() {
+  declare desc="validate a username or group name used in an ACL subject"
+  local name="$1"
+
+  [[ -n "$name" ]] || return 1
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+fn-login-auth-json-array() {
+  declare desc="emit a sorted, deduplicated JSON array from the given strings"
+  local item
+  local -a items=()
+  for item in "$@"; do
+    [[ -n "$item" ]] && items+=("$item")
+  done
+  if [[ ${#items[@]} -eq 0 ]]; then
+    printf '[]'
+    return
+  fi
+  printf '%s\n' "${items[@]}" | jq -R . | jq -s 'unique | sort'
+}
+
+fn-login-auth-access-read() {
+  declare desc="emit an app's access allow list as normalized JSON"
+  declare APP="$1"
+
+  fn-login-auth-state-read "$APP" | jq -c '.access'
+}
+
+fn-login-auth-access-set() {
+  declare desc="replace an app's access allow list (JSON arrays)"
+  declare APP="$1" USERS_JSON="$2" GROUPS_JSON="$3"
+  local json
+  json="$(fn-login-auth-state-read "$APP" | jq --arg app "$APP" \
+    --argjson users "$USERS_JSON" --argjson groups "$GROUPS_JSON" '
+    .app = $app
+    | .access = {
+        users: (($users // []) | unique | sort),
+        groups: (($groups // []) | unique | sort)
+      }
+  ')"
+  fn-login-auth-state-write "$APP" "$json"
 }
 
 fn-login-auth-set-path() {
@@ -607,6 +657,15 @@ fn-login-auth-user-exists() {
   file="$(fn-login-auth-users-file)"
   [[ -f "$file" ]] || return 1
   env USER_NAME="$USERNAME" yq eval -e '.users | has(strenv(USER_NAME))' "$file" >/dev/null 2>&1
+}
+
+fn-login-auth-group-exists() {
+  declare desc="check whether at least one user has the given group"
+  declare GROUP_NAME="$1"
+  local file
+  file="$(fn-login-auth-users-file)"
+  [[ -f "$file" ]] || return 1
+  yq eval -r '.users[]?.groups[]?' "$file" 2>/dev/null | grep -Fxq -- "$GROUP_NAME"
 }
 
 fn-login-auth-user-create() {

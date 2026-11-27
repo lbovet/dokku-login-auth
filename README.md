@@ -88,6 +88,8 @@ login-auth:disable-form <app> [--path </prefix>]
 login-auth:enable-apikey <app> --path </prefix> [--force]
 login-auth:disable-apikey <app> --path </prefix>
 login-auth:bypass <app> --path </prefix> [--force]
+login-auth:access-set <app> [--user <username>]... [--group <group>]...
+login-auth:access-list <app>
 login-auth:add-key <app> <key-name> [<key-value>] [--from-stdin]
 login-auth:remove-key <app> <key-name>
 login-auth:user-add <username> <password> [--group <group>]... [--displayname <name>] [--email <email>]
@@ -105,6 +107,7 @@ dokku login-auth:user-add alice 'correct horse battery staple' \
   --displayname "Alice" --email alice@example.com
 
 dokku login-auth:enable-form dashboard-ui
+dokku login-auth:access-set dashboard-ui --user alice --group devs
 dokku login-auth:enable-apikey backend-api --path /api
 printf '%s' 'sk_live_abc123' | dokku login-auth:add-key backend-api ci-pipeline --from-stdin
 
@@ -112,10 +115,30 @@ dokku login-auth:enable-form dev-center --path /
 dokku login-auth:bypass dev-center --path /api/webhook/github
 ```
 
+## Per-app access
+
+Access is configured per app, not per path. Every app with at least one
+`form` path has an allow list of users and groups; the allow list applies to
+all of the app's `form` paths. `apikey` and `none` paths are unaffected.
+
+```bash
+dokku login-auth:access-set dashboard-ui --user alice --user bob --group devs
+dokku login-auth:access-list dashboard-ui
+```
+
+- An app with no allow list (or an empty one) is **admin-only**: only the
+  built-in `admin` user may access it. There is no implicit "all authenticated
+  users" access.
+- `admin` always has access to every form-protected app and cannot be removed.
+- Usernames must exist in `users.yml`; groups may be referenced before anyone
+  joins them (the plugin warns).
+- The allow list is stored in the app's `state.json`; the plugin renders the
+  matching Authelia ACL rule on the next mutating command.
+
 ## State
 
 - `/var/lib/dokku/services/login-auth/<app>/state.json` — per-app path/mode
-  state.
+  and access state.
 - `/var/lib/dokku/services/login-auth/_global/state.json` — global settings
   (parent domain, pins).
 - `/etc/nginx/login-auth/<app>/apikeys.map` — API-key value map (mode `0640`,
